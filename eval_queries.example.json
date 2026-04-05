@@ -1,0 +1,32 @@
+[
+  {
+    "query": "How does BM25 scoring work and what are its limitations?",
+    "domain": null,
+    "expected_keywords": ["term frequency", "document length", "inverse document frequency"],
+    "notes": "Classic IR concept; corpus should contain IR textbook or survey material."
+  },
+  {
+    "query": "What are the tradeoffs between dense and sparse retrieval for RAG?",
+    "domain": "retrieval",
+    "expected_keywords": ["semantic", "lexical", "out of vocabulary"],
+    "notes": "Tests whether dense and BM25 complement each other on this query shape."
+  },
+  {
+    "query": "Describe reciprocal rank fusion",
+    "domain": null,
+    "expected_keywords": ["rank", "k", "reciprocal"],
+    "notes": "RRF definition question; good sanity check for both retrievers."
+  },
+  {
+    "query": "When should you fine-tune an embedding model versus using a general-purpose one?",
+    "domain": "ml",
+    "expected_keywords": ["domain", "distribution", "triplet", "contrastive"],
+    "notes": "Decision-framework question."
+  },
+  {
+    "query": "What is chunk-level vs document-level retrieval?",
+    "domain": "retrieval",
+    "expected_keywords": ["chunk", "context window", "passage"],
+    "notes": "Conceptual question about index granularity."
+  }
+]

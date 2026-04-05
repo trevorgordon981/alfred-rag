@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Models and indexes (large, do not commit)
+models/
+indexes/
+*.safetensors
+*.bin
+*.gguf
+*.pt
+
+# Training data and eval outputs (may contain sensitive text)
+training_data/
+eval_results/
+eval_queries.json
+!eval_queries.example.json
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
