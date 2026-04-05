@@ -130,6 +130,15 @@ The server exposes Prometheus metrics at `/metrics`:
 
 Pair with Grafana for a basic retrieval dashboard.
 
+## Related projects
+
+Part of a self-hosted LLM operations toolkit:
+
+- [blockops-proxy](https://github.com/trevorgordon981/blockops-proxy) — tool-call-translating proxy that fronts this RAG server for OpenAI-compatible clients
+- [llm-otel-proxy](https://github.com/trevorgordon981/llm-otel-proxy) — OTel metrics proxy that tracks tokens/cost/latency on this server's traffic
+- [alfred-infra](https://github.com/trevorgordon981/alfred-infra) — monitoring + backup infrastructure for multi-machine local-LLM clusters
+- [context-bench](https://github.com/trevorgordon981/context-bench) — benchmark the embedding/reranker throughput across context sizes
+
 ## License
 
 MIT
