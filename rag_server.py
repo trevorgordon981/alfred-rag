@@ -1,5 +1,6 @@
 import torch
 import json
+import os
 import re
 import time
 import threading
@@ -16,6 +17,15 @@ from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 # Deployment root. Everything below resolves under it, so the server runs from any
 # checkout without editing paths. Override any individual path with its own env var.
 RAG_ROOT = os.environ.get("RAG_ROOT", os.path.dirname(os.path.abspath(__file__)))
+
+# Immutable Hub revisions. Override alongside a private/local model path when
+# deliberately qualifying another revision.
+EMBED_MODEL_REVISION = os.environ.get(
+    "EMBED_MODEL_REVISION", "1d8ad4ca9b3dd8059ad90a75d4983776a23d44af"
+)
+RERANKER_MODEL_REVISION = os.environ.get(
+    "RERANKER_MODEL_REVISION", "77d193c791ed757ca307ee72715aa132723da912"
+)
 
 app = FastAPI(title="Alfred RAG Server")
 
@@ -145,6 +155,7 @@ def load_models():
     print("Loading Qwen3-Embedding-8B...")
     embed_model = SentenceTransformer(
         os.environ.get("EMBED_MODEL_PATH", "Qwen/Qwen3-Embedding-8B"),
+        revision=EMBED_MODEL_REVISION,
         device="cuda"
     )
     print("Embedding model loaded.")
@@ -152,10 +163,12 @@ def load_models():
     print("Loading Qwen3-Reranker-8B...")
     reranker_tokenizer = AutoTokenizer.from_pretrained(
         os.environ.get("RERANKER_MODEL_PATH", "Qwen/Qwen3-Reranker-8B"),
+        revision=RERANKER_MODEL_REVISION,
         trust_remote_code=True
     )
     reranker_model = AutoModelForCausalLM.from_pretrained(
         os.environ.get("RERANKER_MODEL_PATH", "Qwen/Qwen3-Reranker-8B"),
+        revision=RERANKER_MODEL_REVISION,
         dtype=torch.float16,
         device_map="cuda",
         trust_remote_code=True
