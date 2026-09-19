@@ -58,7 +58,9 @@ You'll need to build `indexes/lancedb/` (vector) and `indexes/tantivy/` (BM25) f
 ```bash
 # With env-configured paths
 export EMBED_MODEL_PATH=Qwen/Qwen3-Embedding-8B
+export EMBED_MODEL_REVISION=1d8ad4ca9b3dd8059ad90a75d4983776a23d44af
 export RERANKER_MODEL_PATH=Qwen/Qwen3-Reranker-8B
+export RERANKER_MODEL_REVISION=77d193c791ed757ca307ee72715aa132723da912
 export LANCEDB_PATH=./indexes/lancedb
 export TANTIVY_PATH=./indexes/tantivy
 export LANCE_TABLE=corpus
@@ -112,7 +114,9 @@ All paths and models are env-configurable. Server defaults:
 | Variable | Default |
 |---|---|
 | `EMBED_MODEL_PATH` | `Qwen/Qwen3-Embedding-8B` |
+| `EMBED_MODEL_REVISION` | `1d8ad4ca9b3dd8059ad90a75d4983776a23d44af` |
 | `RERANKER_MODEL_PATH` | `Qwen/Qwen3-Reranker-8B` |
+| `RERANKER_MODEL_REVISION` | `77d193c791ed757ca307ee72715aa132723da912` |
 | `LANCEDB_PATH` | `./indexes/lancedb` |
 | `TANTIVY_PATH` | `./indexes/tantivy` |
 | `LANCE_TABLE` | `corpus` |
