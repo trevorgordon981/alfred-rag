@@ -31,22 +31,22 @@ app = FastAPI(title="Alfred RAG Server")
 
 # --- Prometheus metrics ---
 RAG_TOKENS_INPUT = Counter(
-    "llm_llm_tokens_input_total",
+    "llm_tokens_input_total",
     "Total input tokens processed",
     ["model", "endpoint", "job"]
 )
-RAG_TOKENS_OUTPUT = Counter(
-    "llm_llm_tokens_output_total",
-    "Total output tokens processed",
+RAG_RERANK_SCORED = Counter(
+    "llm_rerank_scored_docs_total",
+    "Documents scored by the reranker cross-encoder (one yes/no decision each)",
     ["model", "endpoint", "job"]
 )
 RAG_REQUESTS = Counter(
-    "llm_llm_requests_total",
+    "llm_requests_total",
     "Total requests processed",
     ["model", "endpoint", "job"]
 )
 RAG_TOOL_CALLS = Counter(
-    "llm_llm_tool_calls_total",
+    "llm_tool_calls_total",
     "Total tool calls (search operations)",
     ["model", "endpoint", "job"]
 )
@@ -342,7 +342,7 @@ def _rerank_docs(query: str, documents: list[str]) -> list[float]:
             ).to(reranker_model.device)
 
             RAG_TOKENS_INPUT.labels(**LABEL_RERANK).inc(int(inputs["input_ids"].numel()))
-            RAG_TOKENS_OUTPUT.labels(**LABEL_RERANK).inc(len(batch))  # one yes/no per doc
+            RAG_RERANK_SCORED.labels(**LABEL_RERANK).inc(len(batch))  # one yes/no per doc
 
             with torch.no_grad():
                 # H2: logits_to_keep=1 computes logits for only the last position
