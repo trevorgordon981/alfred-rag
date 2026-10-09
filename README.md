@@ -4,6 +4,24 @@ A hybrid RAG stack: dense embeddings (LanceDB) plus BM25 (Tantivy) with Reciproc
 
 Built originally for a personal knowledge-base RAG running on a DGX Spark, serving a multi-domain corpus of technical documentation, personal notes, and reference material.
 
+## Results
+
+Scoring is **keyword-hit based**. Each eval query carries a list of `expected_keywords`, and a retrieved chunk counts as a hit when its text contains one of them. There is no human or model judgment in the loop and no partial credit, so read the pass rate as a retrieval smoke test, not an answer-quality score. `rag_eval.py` records hit counts at every stage (dense, BM25, post-RRF, post-rerank) so you can see which stage dropped a chunk.
+
+The harness in this repo ships 20 example queries across 11 domain groups (automotive, manual, TSB, rennlist, buddhist, stoic, finance, trading, strategy, news, personal) plus one deliberate cross-domain query.
+
+Against the full private corpus the same harness runs 62 queries over those 11 domains and passes 60, a 96.7% pass rate. Both failures are out-of-domain queries where the reranker is too generous: it promotes a plausible-looking chunk from an adjacent domain instead of returning nothing. That query set is not in this repo because the queries and their expected keywords reference private documents.
+
+### Embedding fine-tuning split
+
+`finetune_embedding.py` holds out a tail fraction of the query/positive pairs and builds an `InformationRetrievalEvaluator` from it. The default `--eval-split` is `0.1` (override with `EVAL_SPLIT`), so the 3600-pair corpus described under [Fine-tuning](#fine-tuning) trains on roughly 3240 pairs and evaluates on the remaining 360.
+
+<!-- TODO(trevor): no baseline-vs-fine-tuned retrieval comparison exists in this repo.
+     To fill in a table here: run rag_eval.py twice against the same corpus and the
+     same query file, once with EMBED_MODEL_PATH=Qwen/Qwen3-Embedding-8B and once
+     with the fine-tuned checkpoint, then paste both pass rates and the per-stage
+     keyword-hit counts from eval_summary.csv. -->
+
 ## Components
 
 | File | Purpose |
@@ -138,10 +156,9 @@ Pair with Grafana for a basic retrieval dashboard.
 
 Part of a self-hosted LLM operations toolkit:
 
-- [blockops-proxy](https://github.com/trevorgordon981/blockops-proxy) — tool-call-translating proxy that fronts this RAG server for OpenAI-compatible clients
-- [llm-otel-proxy](https://github.com/trevorgordon981/llm-otel-proxy) — OTel metrics proxy that tracks tokens/cost/latency on this server's traffic
-- [alfred-infra](https://github.com/trevorgordon981/alfred-infra) — monitoring + backup infrastructure for multi-machine local-LLM clusters
-- [context-bench](https://github.com/trevorgordon981/context-bench) — benchmark the embedding/reranker throughput across context sizes
+- [gordon-gateway](https://github.com/trevorgordon981/gordon-gateway) - LLM gateway that fronts this RAG server for OpenAI-compatible clients: routing, tool-call translation, and OTLP tracing of tokens, cost, and latency
+- [alfred-infra](https://github.com/trevorgordon981/alfred-infra) - monitoring + backup infrastructure for multi-machine local-LLM clusters
+- [context-bench](https://github.com/trevorgordon981/context-bench) - benchmark the embedding/reranker throughput across context sizes
 
 ## License
 
