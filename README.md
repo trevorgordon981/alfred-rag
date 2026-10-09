@@ -145,10 +145,13 @@ All paths and models are env-configurable. Server defaults:
 
 The server exposes Prometheus metrics at `/metrics`:
 
-- `llm_llm_tokens_input_total{endpoint, model, job}` — embedded + reranked input tokens
-- `llm_llm_tokens_output_total{endpoint, model, job}` — reranker yes/no logit count
-- `llm_llm_requests_total{endpoint, model, job}` — request count per endpoint
-- `llm_llm_tool_calls_total` — search invocations
+- `llm_tokens_input_total{endpoint, model, job}` - embedded + reranked input tokens
+- `llm_rerank_scored_docs_total{endpoint, model, job}` - documents scored by the reranker, one yes/no decision each
+- `llm_requests_total{endpoint, model, job}` - request count per endpoint
+- `llm_tool_calls_total{endpoint, model, job}` - search invocations
+
+This server embeds and reranks; it never generates, so there is no output-token
+counter. The reranker metric counts scoring decisions, not tokens.
 
 Pair with Grafana for a basic retrieval dashboard.
 
