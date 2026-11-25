@@ -9,6 +9,7 @@ import tantivy
 import lancedb
 import numpy as np
 from fastapi import FastAPI, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -72,7 +73,7 @@ _GPU_LOCK = threading.Lock()
 
 LANCEDB_PATH = os.environ.get("LANCEDB_PATH", os.path.join(RAG_ROOT, "indexes", "lancedb"))
 TANTIVY_PATH = os.environ.get("TANTIVY_PATH", os.path.join(RAG_ROOT, "indexes", "tantivy"))
-LANCE_TABLE = "alfred_rag"
+LANCE_TABLE = os.environ.get("LANCE_TABLE", "alfred_rag")
 
 class EmbedRequest(BaseModel):
     texts: list[str]
@@ -95,9 +96,11 @@ class SearchRequest(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    ready: bool
     models: list[str]
     indexes: dict
     uptime: float
+    reason: str | None = None
 
 START_TIME = time.time()
 
@@ -202,23 +205,63 @@ def load_models():
     _start_refresh_timer()
 
 
-@app.get("/health")
-def health() -> HealthResponse:
-    if lance_table:
-        lance_table.checkout_latest()
-        lance_count = lance_table.count_rows()
+def _collect_index_health() -> tuple[int, int, list[str]]:
+    """Return (lance_count, tantivy_count, issues) for the loaded indexes."""
+    issues: list[str] = []
+
+    if lance_table is not None:
+        try:
+            lance_table.checkout_latest()
+            lance_count = int(lance_table.count_rows())
+        except Exception as e:
+            lance_count = 0
+            issues.append(f"LanceDB index error: {e}")
     else:
         lance_count = 0
-    tantivy_count = 0
-    if tantivy_index:
-        tantivy_index.reload()
-        tantivy_count = tantivy_index.searcher().num_docs
-    return HealthResponse(
-        status="ok",
+
+    if tantivy_index is not None:
+        try:
+            tantivy_index.reload()
+            tantivy_count = int(tantivy_index.searcher().num_docs)
+        except Exception as e:
+            tantivy_count = 0
+            issues.append(f"Tantivy index error: {e}")
+    else:
+        tantivy_count = 0
+
+    if lance_count <= 0 and not any("LanceDB" in issue for issue in issues):
+        issues.append("LanceDB index is empty (0 rows)")
+    if tantivy_count <= 0 and not any("Tantivy" in issue for issue in issues):
+        issues.append("Tantivy index is empty (0 docs)")
+
+    return lance_count, tantivy_count, issues
+
+
+def _build_health_response(unhealthy_status: str) -> JSONResponse:
+    lance_count, tantivy_count, issues = _collect_index_health()
+    is_ready = not issues
+    payload = HealthResponse(
+        status="ok" if is_ready else unhealthy_status,
+        ready=is_ready,
         models=["qwen3-embedding-8b", "qwen3-reranker-8b"],
         indexes={"lancedb": lance_count, "tantivy": tantivy_count},
-        uptime=time.time() - START_TIME
+        uptime=time.time() - START_TIME,
+        reason=None if is_ready else "; ".join(issues),
     )
+    return JSONResponse(
+        status_code=200 if is_ready else 503,
+        content=payload.model_dump(),
+    )
+
+
+@app.get("/health", response_model=HealthResponse)
+def health() -> JSONResponse:
+    return _build_health_response(unhealthy_status="unhealthy")
+
+
+@app.get("/ready", response_model=HealthResponse)
+def ready() -> JSONResponse:
+    return _build_health_response(unhealthy_status="not_ready")
 
 
 @app.get("/metrics")
@@ -779,11 +822,18 @@ class IngestRequest(BaseModel):
     reset: bool = False
 
 
+def _resolve_ingest_script() -> str:
+    """Resolve INGEST_SCRIPT relative to RAG_ROOT when not an absolute path."""
+    if os.path.isabs(INGEST_SCRIPT):
+        return INGEST_SCRIPT
+    return os.path.abspath(os.path.join(RAG_ROOT, INGEST_SCRIPT))
+
+
 def _ingest_already_running() -> int | None:
     """Return the pid of a running ingest.py, or None.
 
     Detects and cleans up zombies: os.kill(pid, 0) returns success for
-    defunct processes, so we also check /proc/<pid>/status State field.
+    defunct processes, so we also check /proc/<pid>/status State field on Linux.
     """
     if not os.path.exists(INGEST_LOCKFILE):
         return None
@@ -791,18 +841,19 @@ def _ingest_already_running() -> int | None:
         with open(INGEST_LOCKFILE) as f:
             pid = int(f.read().strip())
         os.kill(pid, 0)
-        # Zombie check: /proc/<pid>/status State field starts with 'Z' for
-        # defunct processes, which os.kill still accepts as valid.
-        try:
-            with open(f"/proc/{pid}/status") as sf:
-                for line in sf:
-                    if line.startswith("State:"):
-                        state_char = line.split()[1]
-                        if state_char.startswith("Z"):
-                            raise ProcessLookupError(f"pid {pid} is zombie")
-                        break
-        except FileNotFoundError:
-            raise ProcessLookupError(f"pid {pid} no /proc entry")
+        # Zombie check on Linux: /proc/<pid>/status State field starts with 'Z'
+        # for defunct processes, which os.kill still accepts as valid.
+        if os.path.isdir("/proc"):
+            try:
+                with open(f"/proc/{pid}/status") as sf:
+                    for line in sf:
+                        if line.startswith("State:"):
+                            state_char = line.split()[1]
+                            if state_char.startswith("Z"):
+                                raise ProcessLookupError(f"pid {pid} is zombie")
+                            break
+            except FileNotFoundError:
+                raise ProcessLookupError(f"pid {pid} no /proc entry")
         return pid
     except (ValueError, ProcessLookupError, PermissionError, FileNotFoundError):
         try:
@@ -815,6 +866,16 @@ def _ingest_already_running() -> int | None:
 @app.post("/ingest")
 def ingest(req: IngestRequest):
     """Trigger incremental (default) or full-reset ingestion in the background."""
+    script_path = _resolve_ingest_script()
+    if not os.path.isfile(script_path):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error": f"Ingest builder script not found: {script_path}",
+            },
+        )
+
     existing = _ingest_already_running()
     if existing is not None:
         return {
@@ -823,18 +884,18 @@ def ingest(req: IngestRequest):
             "log": INGEST_LOG,
         }
 
-    args = [INGEST_PYTHON, INGEST_SCRIPT]
+    args = [INGEST_PYTHON, script_path]
     if req.reset:
         args.append("--reset")
 
-    log_f = open(INGEST_LOG, "ab")
-    proc = subprocess.Popen(
-        args,
-        stdout=log_f,
-        stderr=subprocess.STDOUT,
-        cwd=RAG_ROOT,
-        start_new_session=True,
-    )
+    with open(INGEST_LOG, "ab") as log_f:
+        proc = subprocess.Popen(
+            args,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            cwd=RAG_ROOT,
+            start_new_session=True,
+        )
     try:
         with open(INGEST_LOCKFILE, "w") as f:
             f.write(str(proc.pid))
@@ -845,6 +906,7 @@ def ingest(req: IngestRequest):
         "status": "started",
         "pid": proc.pid,
         "mode": "reset" if req.reset else "incremental",
+        "script": script_path,
         "log": INGEST_LOG,
     }
 

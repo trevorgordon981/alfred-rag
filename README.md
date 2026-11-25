@@ -26,7 +26,8 @@ Against the full private corpus the same harness runs 62 queries over those 11 d
 
 | File | Purpose |
 |---|---|
-| `rag_server.py` | FastAPI server: `/embed`, `/rerank`, `/search` (hybrid + RRF + rerank), `/health`, `/metrics` |
+| `rag_server.py` | FastAPI server: `/embed`, `/rerank`, `/search` (hybrid + RRF + rerank), `/ingest`, `/health`, `/ready`, `/metrics` |
+| `scripts/ingest.py` | Corpus builder: cleans, chunks, embeds, and indexes `.md`/`.txt`/`.rst`/`.json`/`.jsonl` documents into LanceDB + Tantivy (incremental or `--reset`) |
 | `rag_eval.py` | Eval harness: runs a list of queries, scores keyword hits, writes per-query JSON + summary CSV |
 | `finetune_embedding.py` | Fine-tune Qwen3-Embedding-8B (or any sentence-transformers base) on query/positive pairs with MultipleNegativesRankingLoss |
 | `eval_queries.example.json` | Schema example for eval queries |
@@ -69,7 +70,13 @@ pip install -r requirements.txt
 
 ### 2. Index your corpus
 
-You'll need to build `indexes/lancedb/` (vector) and `indexes/tantivy/` (BM25) from your documents. This repo doesn't ship an ingest script because corpus-prep is inherently bespoke. At minimum each document chunk should have: `id`, `text`, `domain`, `filename`, `url`, `source`, `format`, `chunk_index`, `vector`.
+Place your source documents under `./data/<domain>/` (`.md`, `.txt`, `.rst`, `.json`, or `.jsonl`) and build `indexes/lancedb/` (vector) and `indexes/tantivy/` (BM25) with `scripts/ingest.py`:
+
+```bash
+python scripts/ingest.py --data-dir ./data --reset
+```
+
+Each document chunk is stored with `id`, `text`, `domain`, `filename`, `url`, `source`, `format`, `chunk_index`, and `vector`. Subsequent runs are incremental by default (or triggered via `POST /ingest` on the running server). `/health` and `/ready` return HTTP `503` until both LanceDB and Tantivy indexes are populated.
 
 ### 3. Serve
 
@@ -81,7 +88,7 @@ export RERANKER_MODEL_PATH=Qwen/Qwen3-Reranker-8B
 export RERANKER_MODEL_REVISION=77d193c791ed757ca307ee72715aa132723da912
 export LANCEDB_PATH=./indexes/lancedb
 export TANTIVY_PATH=./indexes/tantivy
-export LANCE_TABLE=corpus
+export LANCE_TABLE=alfred_rag
 export PORT=9000
 export DEVICE=cuda  # or "mps" / "cpu"
 
@@ -137,7 +144,9 @@ All paths and models are env-configurable. Server defaults:
 | `RERANKER_MODEL_REVISION` | `77d193c791ed757ca307ee72715aa132723da912` |
 | `LANCEDB_PATH` | `./indexes/lancedb` |
 | `TANTIVY_PATH` | `./indexes/tantivy` |
-| `LANCE_TABLE` | `corpus` |
+| `LANCE_TABLE` | `alfred_rag` |
+| `DATA_DIR` | `./data` |
+| `INGEST_SCRIPT` | `./scripts/ingest.py` |
 | `DEVICE` | `cuda` if available else `cpu` |
 | `PORT` | `9000` |
 
