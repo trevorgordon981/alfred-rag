@@ -13,57 +13,56 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _install_heavy_dep_stubs() -> None:
-    """Stub heavy optional ML/index dependencies so rag_server imports offline."""
-    if "torch" not in sys.modules:
-        torch_mod = types.ModuleType("torch")
-        torch_mod.float16 = "float16"
-        torch_mod.no_grad = mock.MagicMock
-        torch_mod.sigmoid = lambda x: x
-        sys.modules["torch"] = torch_mod
+    """Stub heavy optional ML/index dependencies only if not installed."""
+    for mod_name in ("torch", "sentence_transformers", "transformers"):
+        if mod_name not in sys.modules:
+            try:
+                __import__(mod_name)
+            except ImportError:
+                stub = types.ModuleType(mod_name)
+                if mod_name == "torch":
+                    stub.float16 = "float16"
+                    stub.float32 = "float32"
+                    stub.no_grad = mock.MagicMock
+                    stub.sigmoid = lambda x: x
+                    stub.cuda = types.SimpleNamespace(is_available=lambda: False)
+                    stub.backends = types.SimpleNamespace(
+                        mps=types.SimpleNamespace(is_available=lambda: False)
+                    )
+                elif mod_name == "sentence_transformers":
+                    stub.SentenceTransformer = mock.MagicMock
+                elif mod_name == "transformers":
+                    stub.AutoTokenizer = mock.MagicMock
+                    stub.AutoModelForCausalLM = mock.MagicMock
+                sys.modules[mod_name] = stub
 
-    if "tantivy" not in sys.modules:
-        tantivy_mod = types.ModuleType("tantivy")
-        tantivy_mod.SchemaBuilder = mock.MagicMock
-        tantivy_mod.Index = mock.MagicMock
-        tantivy_mod.Document = mock.MagicMock
-        sys.modules["tantivy"] = tantivy_mod
+    for optional_mod in ("tantivy", "lancedb", "prometheus_client"):
+        if optional_mod not in sys.modules:
+            try:
+                __import__(optional_mod)
+            except ImportError:
+                stub = types.ModuleType(optional_mod)
+                if optional_mod == "tantivy":
+                    stub.SchemaBuilder = mock.MagicMock
+                    stub.Index = mock.MagicMock
+                    stub.Document = mock.MagicMock
+                elif optional_mod == "lancedb":
+                    stub.connect = mock.MagicMock
+                elif optional_mod == "prometheus_client":
+                    class _FakeCounter:
+                        def __init__(self, *args, **kwargs):
+                            pass
 
-    if "lancedb" not in sys.modules:
-        lancedb_mod = types.ModuleType("lancedb")
-        lancedb_mod.connect = mock.MagicMock
-        sys.modules["lancedb"] = lancedb_mod
+                        def labels(self, **kwargs):
+                            return self
 
-    if "numpy" not in sys.modules:
-        sys.modules["numpy"] = types.ModuleType("numpy")
+                        def inc(self, amount=1):
+                            pass
 
-    if "sentence_transformers" not in sys.modules:
-        st_mod = types.ModuleType("sentence_transformers")
-        st_mod.SentenceTransformer = mock.MagicMock
-        sys.modules["sentence_transformers"] = st_mod
-
-    if "transformers" not in sys.modules:
-        tr_mod = types.ModuleType("transformers")
-        tr_mod.AutoTokenizer = mock.MagicMock
-        tr_mod.AutoModelForCausalLM = mock.MagicMock
-        sys.modules["transformers"] = tr_mod
-
-    if "prometheus_client" not in sys.modules:
-        prom_mod = types.ModuleType("prometheus_client")
-
-        class _FakeCounter:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def labels(self, **kwargs):
-                return self
-
-            def inc(self, amount=1):
-                pass
-
-        prom_mod.Counter = _FakeCounter
-        prom_mod.generate_latest = lambda: b""
-        prom_mod.CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
-        sys.modules["prometheus_client"] = prom_mod
+                    stub.Counter = _FakeCounter
+                    stub.generate_latest = lambda: b""
+                    stub.CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
+                sys.modules[optional_mod] = stub
 
 
 _install_heavy_dep_stubs()
@@ -119,13 +118,27 @@ def _load_ingest_module(script_path: str):
 
 class TestHealthAndReadiness(unittest.TestCase):
     def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
         self._orig_lance = rag_server.lance_table
         self._orig_tantivy = rag_server.tantivy_index
+        self._orig_lancedb_path = rag_server.LANCEDB_PATH
+        self._orig_tantivy_path = rag_server.TANTIVY_PATH
+        self._orig_api_key = rag_server.RAG_API_KEY
+        self._orig_admin_key = rag_server.RAG_ADMIN_API_KEY
+        rag_server.LANCEDB_PATH = os.path.join(self._tmpdir.name, "lancedb")
+        rag_server.TANTIVY_PATH = os.path.join(self._tmpdir.name, "tantivy")
+        rag_server.RAG_API_KEY = ""
+        rag_server.RAG_ADMIN_API_KEY = ""
         self.client = TestClient(rag_server.app)
 
     def tearDown(self) -> None:
         rag_server.lance_table = self._orig_lance
         rag_server.tantivy_index = self._orig_tantivy
+        rag_server.LANCEDB_PATH = self._orig_lancedb_path
+        rag_server.TANTIVY_PATH = self._orig_tantivy_path
+        rag_server.RAG_API_KEY = self._orig_api_key
+        rag_server.RAG_ADMIN_API_KEY = self._orig_admin_key
+        self._tmpdir.cleanup()
 
     def test_unloaded_indexes_return_503_unhealthy(self) -> None:
         rag_server.lance_table = None
@@ -215,12 +228,18 @@ class TestIngestBuilder(unittest.TestCase):
         self._orig_script = rag_server.INGEST_SCRIPT
         self._orig_lockfile = rag_server.INGEST_LOCKFILE
         self._orig_log = rag_server.INGEST_LOG
+        self._orig_api_key = rag_server.RAG_API_KEY
+        self._orig_admin_key = rag_server.RAG_ADMIN_API_KEY
+        rag_server.RAG_API_KEY = ""
+        rag_server.RAG_ADMIN_API_KEY = ""
         self.client = TestClient(rag_server.app)
 
     def tearDown(self) -> None:
         rag_server.INGEST_SCRIPT = self._orig_script
         rag_server.INGEST_LOCKFILE = self._orig_lockfile
         rag_server.INGEST_LOG = self._orig_log
+        rag_server.RAG_API_KEY = self._orig_api_key
+        rag_server.RAG_ADMIN_API_KEY = self._orig_admin_key
 
     def test_default_ingest_script_exists_in_repo_and_compiles(self) -> None:
         script_path = Path(rag_server._resolve_ingest_script()).resolve()
@@ -229,10 +248,8 @@ class TestIngestBuilder(unittest.TestCase):
             str(script_path).startswith(str(REPO_ROOT)),
             f"Ingest script must live inside repo ({REPO_ROOT}), got {script_path}",
         )
-        # Validate Python syntax via py_compile
         py_compile.compile(str(script_path), doraise=True)
 
-        # Validate module loads cleanly and exposes expected callables
         mod = _load_ingest_module(str(script_path))
         self.assertTrue(callable(mod.main))
         self.assertTrue(callable(mod.ingest))
@@ -293,7 +310,6 @@ class TestIngestBuilder(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            # Dry-run via CLI entrypoint
             rc = ingest_mod.main(["--data-dir", str(data_dir), "--dry-run"])
             self.assertEqual(rc, 0)
 
@@ -301,11 +317,23 @@ class TestIngestBuilder(unittest.TestCase):
             self.assertEqual(len(chunks), 1)
             self.assertEqual(chunks[0]["domain"], "finance")
             self.assertEqual(chunks[0]["filename"], "options.md")
+            self.assertEqual(chunks[0]["doc_id"], "finance/options.md")
+            self.assertEqual(chunks[0]["source_class"], "curated")
             self.assertNotIn("LOG IN", chunks[0]["text"])
-            for field in ("id", "text", "domain", "filename", "url", "source", "format", "chunk_index"):
+            for field in (
+                "id",
+                "doc_id",
+                "text",
+                "domain",
+                "filename",
+                "url",
+                "source",
+                "source_class",
+                "format",
+                "chunk_index",
+            ):
                 self.assertIn(field, chunks[0])
 
-            # Full ingest + incremental no-op with mocked backends
             created_rows = []
             added_docs = []
 
@@ -342,7 +370,11 @@ class TestIngestBuilder(unittest.TestCase):
             tantivy_dir = str(Path(tmpdir) / "indexes" / "tantivy")
 
             with (
-                mock.patch.object(ingest_mod, "embed_texts", side_effect=lambda texts, **kw: [[0.1, 0.2]] * len(texts)),
+                mock.patch.object(
+                    ingest_mod,
+                    "embed_texts",
+                    side_effect=lambda texts, **kw: [[0.1, 0.2]] * len(texts),
+                ),
                 mock.patch.object(sys.modules["lancedb"], "connect", return_value=mock_db),
                 mock.patch.object(sys.modules["tantivy"], "Index", _MockIndex),
             ):
@@ -363,7 +395,6 @@ class TestIngestBuilder(unittest.TestCase):
             self.assertEqual(first["chunks_written"], 2)
             self.assertEqual(len(created_rows), 2)
             self.assertEqual(len(added_docs), 2)
-            # Incremental run skips unchanged files
             self.assertEqual(second["files_scanned"], 2)
             self.assertEqual(second["files_ingested"], 0)
             self.assertEqual(second["chunks_written"], 0)

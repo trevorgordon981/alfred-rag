@@ -1,0 +1,94 @@
+[
+  {
+    "id": "q-rrf-formula",
+    "query": "How does Reciprocal Rank Fusion merge dense and BM25 rankings?",
+    "domain": null,
+    "expected_doc_ids": ["retrieval/hybrid_rrf_notes.md"],
+    "expected_spans": ["score(d) = sum(1 / (k + rank_i))"],
+    "expected_keywords": ["Reciprocal Rank Fusion", "k=60", "reranker"],
+    "notes": "Hybrid retrieval architecture and RRF formula"
+  },
+  {
+    "id": "q-lancedb-refine",
+    "query": "How does refine_factor affect LanceDB IVF_PQ vector recall?",
+    "domain": null,
+    "expected_doc_ids": ["docs/lancedb_ivfpq_reference.md"],
+    "expected_spans": ["refine_factor=20", "lifts recall@10 from roughly 0.47 to over 0.91"],
+    "expected_keywords": ["IVF_PQ", "refine_factor", "nprobes"],
+    "notes": "Vendor reference doc lookup under docs/"
+  },
+  {
+    "id": "q-tantivy-raw-id",
+    "query": "Why should Tantivy identifier fields use the raw tokenizer for deletion?",
+    "domain": null,
+    "expected_doc_ids": ["docs/tantivy_bm25_reference.md"],
+    "expected_spans": ["tokenizer_name=\"raw\"", "term deletions match exact values"],
+    "expected_keywords": ["Tantivy", "raw", "reload"],
+    "notes": "Tantivy deletion semantics"
+  },
+  {
+    "id": "q-security-bind",
+    "query": "What environment variables are required before binding the server externally beyond loopback?",
+    "domain": "operations",
+    "expected_doc_ids": ["operations/notes.md"],
+    "expected_spans": ["ALLOW_EXTERNAL_BIND=1", "RAG_API_KEY", "RAG_ADMIN_API_KEY"],
+    "expected_keywords": ["127.0.0.1", "ALLOW_EXTERNAL_BIND", "RAG_API_KEY"],
+    "notes": "Domain-filtered query hitting operations/notes.md"
+  },
+  {
+    "id": "q-deletion-reconcile",
+    "query": "How does incremental ingestion handle deleted or emptied files across LanceDB and Tantivy?",
+    "domain": null,
+    "expected_doc_ids": ["engineering/notes.md"],
+    "expected_spans": ["previously indexed chunk IDs are purged from both LanceDB and Tantivy"],
+    "expected_keywords": ["deleted", "emptied", ".generation.json"],
+    "notes": "Same-basename engineering/notes.md distinct from operations/notes.md"
+  },
+  {
+    "id": "q-incident-metrics",
+    "query": "Which Prometheus metric replaced the doubled llm_llm_ output counter for reranker decisions?",
+    "domain": "operations",
+    "expected_doc_ids": ["operations/incidents.jsonl#0"],
+    "expected_spans": ["llm_rerank_scored_docs_total"],
+    "expected_keywords": ["OPS-101", "llm_tokens_input_total", "llm_rerank_scored_docs_total"],
+    "notes": "First JSONL record sharing upstream source incident-feed://ops-primary"
+  },
+  {
+    "id": "q-incident-journal",
+    "query": "What happened in Incident OPS-102 when ingest crashed before committing Tantivy?",
+    "domain": "operations",
+    "expected_doc_ids": ["operations/incidents.jsonl#1"],
+    "expected_spans": ["uncommitted .ingest_journal.json file"],
+    "expected_keywords": ["OPS-102", ".ingest_journal.json", "generation"],
+    "notes": "Second JSONL record sharing upstream source incident-feed://ops-primary"
+  },
+  {
+    "id": "q-chunking-recency",
+    "query": "What are the current chunking guidelines and source diversification policy?",
+    "domain": "retrieval",
+    "expected_doc_ids": ["retrieval/2026-04-10-chunking-guidelines.md"],
+    "expected_spans": ["canonical corpus-relative `doc_id` rather than bare filenames"],
+    "expected_keywords": ["Paragraph-aware", "doc_id", "2026"],
+    "notes": "Recent 2026 guidelines should outrank legacy 2020 guidelines"
+  },
+  {
+    "id": "q-finetune-loss",
+    "query": "Which loss function lets you fine-tune embeddings using only query and positive pairs?",
+    "domain": "ml",
+    "expected_doc_ids": ["ml/embedding_finetuning.md"],
+    "expected_spans": ["MultipleNegativesRankingLoss"],
+    "expected_keywords": ["MultipleNegativesRankingLoss", "InformationRetrievalEvaluator"],
+    "notes": "ML fine-tuning recipe query"
+  },
+  {
+    "id": "q-ood-helium",
+    "query": "What is the boiling point of liquid helium in Kelvin at sea level?",
+    "domain": null,
+    "expect_no_results": true,
+    "min_score": 0.45,
+    "expected_doc_ids": [],
+    "expected_spans": [],
+    "expected_keywords": [],
+    "notes": "Out-of-domain negative control: no corpus document should pass min_score"
+  }
+]
