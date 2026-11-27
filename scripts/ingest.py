@@ -910,12 +910,32 @@ def ingest(
     os.makedirs(tantivy_path, exist_ok=True)
     t_index = tantivy.Index(schema, path=tantivy_path)
     writer = t_index.writer()
-    for cid in stale_ids:
-        _tantivy_delete_by_id(writer, cid)
-    if all_chunks:
-        _tantivy_add_chunks(tantivy, writer, all_chunks)
-    _commit_and_close_writer(writer)
-    del writer
+    try:
+        for cid in stale_ids:
+            _tantivy_delete_by_id(writer, cid)
+        if all_chunks:
+            _tantivy_add_chunks(tantivy, writer, all_chunks)
+        _commit_and_close_writer(writer)
+    except BaseException:
+        try:
+            if hasattr(writer, "rollback"):
+                writer.rollback()
+        except Exception:
+            pass
+        try:
+            if hasattr(writer, "wait_merging_threads"):
+                writer.wait_merging_threads()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            del writer
+        except NameError:
+            pass
+        import gc
+
+        gc.collect()
 
     _verify_committed_counts(
         db, lance_table_name, t_index, tantivy, schema, total_chunks
