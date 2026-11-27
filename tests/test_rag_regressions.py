@@ -1,4 +1,4 @@
-"""Comprehensive regression tests covering RAG-01 through RAG-09 against real
+"""Comprehensive regression tests covering RAG-01 through RAG-10 against real
 CPU LanceDB and Tantivy indexes.
 """
 
@@ -1870,6 +1870,257 @@ class TestRAG09AtomicReaderReopen(unittest.TestCase):
             self.assertEqual(settled_body["stages"]["dense"][0]["text"], final_text)
             self.assertEqual(settled_body["stages"]["bm25"][0]["text"], final_text)
             self.assertEqual(settled_body["results"][0]["text"], final_text)
+
+
+class TestRAG10TableMismatchFailClosed(unittest.TestCase):
+    """RAG-10: Committed marker lance_table mismatch against configured LANCE_TABLE fails closed."""
+
+    @staticmethod
+    def _run_cli_ingest(
+        *,
+        data_dir: Path,
+        lancedb_dir: str,
+        tantivy_dir: str,
+        lance_table: str | None = None,
+        reset: bool = False,
+    ) -> dict:
+        cmd = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "ingest.py"),
+            "--data-dir",
+            str(data_dir),
+            "--lancedb-path",
+            lancedb_dir,
+            "--tantivy-path",
+            tantivy_dir,
+            "--embed-backend",
+            "offline",
+        ]
+        if lance_table is not None:
+            cmd.extend(["--lance-table", lance_table])
+        if reset:
+            cmd.append("--reset")
+        proc = subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(
+                f"CLI ingest failed (rc={proc.returncode}): stdout={proc.stdout}\nstderr={proc.stderr}"
+            )
+        return json.loads(proc.stdout)
+
+    def test_mismatched_configured_lance_table_fails_closed_with_503_and_recovers_when_aligned(
+        self,
+    ) -> None:
+        with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            (data_dir / "notes").mkdir(parents=True)
+            doc_path = data_dir / "notes" / "corpus.md"
+            lancedb_dir = str(Path(tmpdir) / "lancedb")
+            tantivy_dir = str(Path(tmpdir) / "tantivy")
+
+            old_text = "Shared anchor obsidian protocol original default corpus entry."
+            new_text = "Shared anchor sapphire protocol alternate corpus replacement entry."
+
+            # 1. Normal CLI ingest into default table `alfred_rag` (generation 1, 1 row).
+            doc_path.write_text(old_text, encoding="utf-8")
+            s1 = self._run_cli_ingest(
+                data_dir=data_dir,
+                lancedb_dir=lancedb_dir,
+                tantivy_dir=tantivy_dir,
+                lance_table="alfred_rag",
+                reset=True,
+            )
+            self.assertEqual(s1["generation"], 1)
+            self.assertEqual(s1["total_chunks"], 1)
+
+            rag_server.configure_offline_runtime(
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name="alfred_rag",
+            )
+            client = TestClient(rag_server.app)
+
+            initial_debug = client.post(
+                "/search/debug",
+                json={"query": "shared anchor protocol entry", "top_k": 5},
+            )
+            self.assertEqual(initial_debug.status_code, 200)
+            self.assertEqual(initial_debug.json()["stages"]["dense"][0]["text"], old_text)
+            self.assertEqual(initial_debug.json()["stages"]["bm25"][0]["text"], old_text)
+
+            # 2. Normal CLI ingest writes an alternate table (`alternate_corpus`) on the
+            # same store paths at generation 2 while `alfred_rag` still holds 1 old row.
+            doc_path.write_text(new_text, encoding="utf-8")
+            s2 = self._run_cli_ingest(
+                data_dir=data_dir,
+                lancedb_dir=lancedb_dir,
+                tantivy_dir=tantivy_dir,
+                lance_table="alternate_corpus",
+                reset=False,
+            )
+            self.assertEqual(s2["generation"], 2)
+            self.assertEqual(s2["total_chunks"], 1)
+
+            # Verify the exact RAG-10 on-disk state: both tables exist with 1 row each,
+            # and both .generation.json markers name `alternate_corpus` at generation 2.
+            db = lancedb.connect(lancedb_dir)
+            self.assertIn("alfred_rag", rag_common.lance_table_names(db))
+            self.assertIn("alternate_corpus", rag_common.lance_table_names(db))
+            self.assertEqual(db.open_table("alfred_rag").count_rows(), 1)
+            self.assertEqual(db.open_table("alternate_corpus").count_rows(), 1)
+
+            lance_marker = rag_common.read_json_optional(
+                rag_common.generation_marker_path(lancedb_dir)
+            )
+            tantivy_marker = rag_common.read_json_optional(
+                rag_common.generation_marker_path(tantivy_dir)
+            )
+            self.assertEqual(lance_marker["lance_table"], "alternate_corpus")
+            self.assertEqual(tantivy_marker["lance_table"], "alternate_corpus")
+            self.assertEqual(lance_marker["generation"], 2)
+            self.assertEqual(tantivy_marker["generation"], 2)
+
+            # 3. Server is still configured for `alfred_rag`: MUST fail closed with 503
+            # and `table_mismatch` on /search, /search/debug, /health, and /ready.
+            for endpoint in ("/search", "/search/debug"):
+                blocked = client.post(
+                    endpoint,
+                    json={"query": "shared anchor protocol entry", "top_k": 5},
+                )
+                self.assertEqual(
+                    blocked.status_code,
+                    503,
+                    f"{endpoint} must fail closed on mismatched LANCE_TABLE",
+                )
+                detail = blocked.json()["detail"]
+                self.assertIn("table_mismatch", detail)
+                self.assertIn("alternate_corpus", detail)
+                self.assertIn("alfred_rag", detail)
+
+            health = client.get("/health")
+            self.assertEqual(health.status_code, 503)
+            self.assertFalse(health.json()["ready"])
+            self.assertIn("table_mismatch", health.json()["reason"])
+
+            ready = client.get("/ready")
+            self.assertEqual(ready.status_code, 503)
+            self.assertFalse(ready.json()["ready"])
+            self.assertIn("table_mismatch", ready.json()["reason"])
+
+            self.assertFalse(rag_server._refresh_indexes())
+            self.assertEqual(rag_server.loaded_generation, 1)
+
+            # 4. A freshly started server configured for `alfred_rag` against the same
+            # store paths must also refuse to open mismatched tables and return 503.
+            rag_server.configure_offline_runtime(
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name="alfred_rag",
+            )
+            self.assertIsNone(rag_server.lance_table)
+            self.assertIsNone(rag_server.tantivy_index)
+            self.assertIsNone(rag_server.loaded_generation)
+
+            fresh_health = client.get("/health")
+            self.assertEqual(fresh_health.status_code, 503)
+            self.assertIn("table_mismatch", fresh_health.json()["reason"])
+            fresh_debug = client.post(
+                "/search/debug",
+                json={"query": "shared anchor protocol entry", "top_k": 5},
+            )
+            self.assertEqual(fresh_debug.status_code, 503)
+            self.assertIn("table_mismatch", fresh_debug.json()["detail"])
+
+            # 5. Aligning LANCE_TABLE to `alternate_corpus` cleanly restores HTTP 200
+            # with matching dense and BM25 results from generation 2.
+            rag_server.LANCE_TABLE = "alternate_corpus"
+
+            aligned_health = client.get("/health")
+            self.assertEqual(aligned_health.status_code, 200)
+            self.assertTrue(aligned_health.json()["ready"])
+            self.assertEqual(aligned_health.json()["generation"], 2)
+
+            aligned_debug = client.post(
+                "/search/debug",
+                json={"query": "shared anchor protocol entry", "top_k": 5},
+            )
+            self.assertEqual(aligned_debug.status_code, 200)
+            debug_body = aligned_debug.json()
+            self.assertEqual(debug_body["stages"]["dense"][0]["text"], new_text)
+            self.assertEqual(debug_body["stages"]["bm25"][0]["text"], new_text)
+            self.assertEqual(debug_body["results"][0]["text"], new_text)
+
+            aligned_search = client.post(
+                "/search",
+                json={"query": "shared anchor protocol entry", "top_k": 5},
+            )
+            self.assertEqual(aligned_search.status_code, 200)
+            self.assertEqual(aligned_search.json()["results"][0]["text"], new_text)
+
+    def test_divergent_or_missing_marker_table_fails_closed_with_table_mismatch(self) -> None:
+        with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            (data_dir / "notes").mkdir(parents=True)
+            (data_dir / "notes" / "doc.md").write_text(
+                "Marker validation document for table mismatch checks.",
+                encoding="utf-8",
+            )
+            lancedb_dir = str(Path(tmpdir) / "lancedb")
+            tantivy_dir = str(Path(tmpdir) / "tantivy")
+
+            ingest_mod.ingest(
+                data_dir=str(data_dir),
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name="alfred_rag",
+                embed_backend="offline",
+                reset=True,
+            )
+            rag_server.configure_offline_runtime(
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name="alfred_rag",
+            )
+            client = TestClient(rag_server.app)
+
+            lance_mpath = rag_common.generation_marker_path(lancedb_dir)
+            tantivy_mpath = rag_common.generation_marker_path(tantivy_dir)
+            orig_marker = rag_common.read_json_optional(lance_mpath)
+            assert orig_marker is not None
+
+            # Case A: Only Tantivy marker disagrees on lance_table.
+            rag_common.write_json_atomic(
+                tantivy_mpath, {**orig_marker, "lance_table": "other_table"}
+            )
+            for endpoint in ("/search", "/search/debug"):
+                resp = client.post(endpoint, json={"query": "table mismatch", "top_k": 5})
+                self.assertEqual(resp.status_code, 503)
+                self.assertIn("table_mismatch", resp.json()["detail"])
+            h = client.get("/health")
+            self.assertEqual(h.status_code, 503)
+            self.assertIn("table_mismatch", h.json()["reason"])
+
+            # Case B: Both markers omit lance_table -> fail closed with table_mismatch.
+            no_table = {k: v for k, v in orig_marker.items() if k != "lance_table"}
+            rag_common.write_json_atomic(lance_mpath, no_table)
+            rag_common.write_json_atomic(tantivy_mpath, no_table)
+            resp = client.post("/search", json={"query": "table mismatch", "top_k": 5})
+            self.assertEqual(resp.status_code, 503)
+            self.assertIn("table_mismatch", resp.json()["detail"])
+
+            # Case C: Single marker present (Tantivy missing) naming an alternate table.
+            rag_common.write_json_atomic(
+                lance_mpath, {**orig_marker, "lance_table": "alternate_corpus"}
+            )
+            os.unlink(tantivy_mpath)
+            h_single = client.get("/health")
+            self.assertEqual(h_single.status_code, 503)
+            self.assertIn("table_mismatch", h_single.json()["reason"])
 
 
 class TestOfflineDemoFixture(unittest.TestCase):

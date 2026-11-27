@@ -437,6 +437,7 @@ def _read_marker_fingerprint(path: str) -> tuple[_MarkerFingerprint, str | None]
 
     parsed_gen: int | None = None
     parsed_count: int | None = None
+    parsed_table: str | None = None
     parse_error: str | None = None
 
     if raw_gen is not None:
@@ -457,6 +458,12 @@ def _read_marker_fingerprint(path: str) -> tuple[_MarkerFingerprint, str | None]
             except (TypeError, ValueError):
                 parse_error = f"Invalid index generation chunk_count value: {raw_count!r}"
 
+    if raw_table is not None and parse_error is None:
+        if not isinstance(raw_table, str) or not raw_table.strip():
+            parse_error = f"Invalid index generation lance_table value: {raw_table!r}"
+        else:
+            parsed_table = raw_table
+
     return (
         _MarkerFingerprint(
             exists=True,
@@ -466,7 +473,7 @@ def _read_marker_fingerprint(path: str) -> tuple[_MarkerFingerprint, str | None]
             ino=st.st_ino,
             generation=parsed_gen,
             chunk_count=parsed_count,
-            lance_table=str(raw_table) if raw_table is not None else None,
+            lance_table=parsed_table,
             committed_at=str(raw_committed_at) if raw_committed_at is not None else None,
         ),
         parse_error,
@@ -507,11 +514,31 @@ def _snapshot_store_coordination() -> _StoreCoordinationState:
             issues.append(
                 "Index generation marker missing or unreadable in one store (LanceDB vs Tantivy)"
             )
+            if lance_fp.exists and lance_err is None and lance_fp.lance_table != LANCE_TABLE:
+                issues.append(
+                    f"Index generation table_mismatch: LanceDB={lance_fp.lance_table!r} "
+                    f"vs configured LANCE_TABLE={LANCE_TABLE!r}"
+                )
+            if tantivy_fp.exists and tantivy_err is None and tantivy_fp.lance_table != LANCE_TABLE:
+                issues.append(
+                    f"Index generation table_mismatch: Tantivy={tantivy_fp.lance_table!r} "
+                    f"vs configured LANCE_TABLE={LANCE_TABLE!r}"
+                )
         elif lance_err is not None or tantivy_err is not None:
             if lance_err is not None:
                 issues.append(f"LanceDB generation marker error: {lance_err}")
             if tantivy_err is not None:
                 issues.append(f"Tantivy generation marker error: {tantivy_err}")
+            if lance_err is None and lance_fp.lance_table != LANCE_TABLE:
+                issues.append(
+                    f"Index generation table_mismatch: LanceDB={lance_fp.lance_table!r} "
+                    f"vs configured LANCE_TABLE={LANCE_TABLE!r}"
+                )
+            if tantivy_err is None and tantivy_fp.lance_table != LANCE_TABLE:
+                issues.append(
+                    f"Index generation table_mismatch: Tantivy={tantivy_fp.lance_table!r} "
+                    f"vs configured LANCE_TABLE={LANCE_TABLE!r}"
+                )
         else:
             if lance_fp.generation != tantivy_fp.generation:
                 issues.append(
@@ -527,7 +554,18 @@ def _snapshot_store_coordination() -> _StoreCoordinationState:
                 )
             if lance_fp.lance_table != tantivy_fp.lance_table:
                 issues.append(
-                    f"Index generation table mismatch: LanceDB={lance_fp.lance_table} vs Tantivy={tantivy_fp.lance_table}"
+                    f"Index generation table_mismatch: LanceDB={lance_fp.lance_table!r} "
+                    f"vs Tantivy={tantivy_fp.lance_table!r} (configured LANCE_TABLE={LANCE_TABLE!r})"
+                )
+            elif lance_fp.lance_table is None:
+                issues.append(
+                    f"Index generation table_mismatch: committed markers missing lance_table field "
+                    f"(configured LANCE_TABLE={LANCE_TABLE!r})"
+                )
+            elif lance_fp.lance_table != LANCE_TABLE:
+                issues.append(
+                    f"Index generation table_mismatch: committed={lance_fp.lance_table!r} "
+                    f"vs configured LANCE_TABLE={LANCE_TABLE!r}"
                 )
             if lance_fp.generation is None:
                 issues.append("Index generation marker missing generation field")
@@ -536,6 +574,7 @@ def _snapshot_store_coordination() -> _StoreCoordinationState:
                 and lance_fp.chunk_count == tantivy_fp.chunk_count
                 and lance_fp.committed_at == tantivy_fp.committed_at
                 and lance_fp.lance_table == tantivy_fp.lance_table
+                and lance_fp.lance_table == LANCE_TABLE
             ):
                 committed_generation = lance_fp.generation
                 expected_chunk_count = lance_fp.chunk_count
