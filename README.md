@@ -141,6 +141,7 @@ This runs unit tests plus real CPU LanceDB + Tantivy integration tests covering:
 - Incremental deletion and emptying across both stores
 - Empty `--reset` agreement across both stores (LanceDB table dropped + Tantivy 0 docs + HTTP 503 readiness)
 - Simulated crash mid-ingest (`.ingest_journal.json` fails `/health`, `/ready`, `/search`, and `/search/debug` with 503 so mixed generations are never served, then next `ingest()` replays cleanly with zero duplicates)
+- Atomic dual-store reader reopen (snapshots pre-open and post-open committed marker state across LanceDB and Tantivy opens, discards torn handles and retries boundedly on equal-count mid-open commits, and fails closed with HTTP 503 if an active writer prevents establishing a consistent generation pair)
 - Short or dimension-mismatched embedding batches (rejected before mutating either store, preserving `.ingest_journal.json` without partial commits)
 - Legacy v1 schema migration (indexes missing `doc_id`/`source_class` or `raw` Tantivy tokenizers are detected at preflight and safely migrated via staged rebuild on incremental ingest without requiring manual `--reset`)
 - `/search` vs `/search/debug` identity across `rerank=True` and `rerank=False`

@@ -1,4 +1,4 @@
-"""Comprehensive regression tests covering RAG-01 through RAG-08 against real
+"""Comprehensive regression tests covering RAG-01 through RAG-09 against real
 CPU LanceDB and Tantivy indexes.
 """
 
@@ -44,6 +44,9 @@ class _ServerStateGuard:
         "lance_table",
         "tantivy_index",
         "loaded_generation",
+        "_loaded_coordination_state",
+        "INDEX_OPEN_MAX_ATTEMPTS",
+        "INDEX_OPEN_RETRY_DELAY_S",
         "active_device",
         "active_models",
         "LANCEDB_PATH",
@@ -1520,6 +1523,353 @@ class TestRAG08ExclusiveIngestAdmission(unittest.TestCase):
             while rag_common.inspect_ingest_lock(lock_path) is not None and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertIsNone(rag_common.inspect_ingest_lock(lock_path))
+
+
+class TestRAG09AtomicReaderReopen(unittest.TestCase):
+    """RAG-09: Reader reopen binds LanceDB and Tantivy to the same clean committed generation."""
+
+    @staticmethod
+    def _run_cli_ingest(
+        *,
+        data_dir: Path,
+        lancedb_dir: str,
+        tantivy_dir: str,
+        lance_table: str,
+        reset: bool = False,
+    ) -> dict:
+        cmd = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "ingest.py"),
+            "--data-dir",
+            str(data_dir),
+            "--lancedb-path",
+            lancedb_dir,
+            "--tantivy-path",
+            tantivy_dir,
+            "--lance-table",
+            lance_table,
+            "--embed-backend",
+            "offline",
+        ]
+        if reset:
+            cmd.append("--reset")
+        proc = subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(
+                f"CLI ingest failed (rc={proc.returncode}): stdout={proc.stdout}\nstderr={proc.stderr}"
+            )
+        return json.loads(proc.stdout)
+
+    def test_mid_open_equal_count_cli_ingest_retries_to_consistent_generation_2(self) -> None:
+        with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            (data_dir / "notes").mkdir(parents=True)
+            doc_path = data_dir / "notes" / "policy.md"
+            lancedb_dir = str(Path(tmpdir) / "lancedb")
+            tantivy_dir = str(Path(tmpdir) / "tantivy")
+            table_name = "rag09_retry"
+
+            gen1_text = "Shared protocol ledger alpha glacier revision one."
+            gen2_text = "Shared protocol ledger beta volcano revision two."
+            gen3_text = "Shared protocol ledger gamma nebula revision three."
+            gen4_text = "Shared protocol ledger delta comet revision four."
+
+            doc_path.write_text(gen1_text, encoding="utf-8")
+            s1 = self._run_cli_ingest(
+                data_dir=data_dir,
+                lancedb_dir=lancedb_dir,
+                tantivy_dir=tantivy_dir,
+                lance_table=table_name,
+                reset=True,
+            )
+            self.assertEqual(s1["generation"], 1)
+            self.assertEqual(s1["total_chunks"], 1)
+
+            # Part A: Pause a genuine LanceDB gen-1 handle open inside _open_indexes()
+            # just before Tantivy opens, run a real equal-count CLI ingest to commit gen 2,
+            # then let Tantivy open. Reader MUST discard the torn (gen1, gen2) pair and retry
+            # cleanly to generation 2 so dense and sparse both serve gen-2 text.
+            real_tantivy_index = rag_server.tantivy.Index
+            open_calls = 0
+
+            def pause_once_before_tantivy(*args, **kwargs):
+                nonlocal open_calls
+                open_calls += 1
+                if open_calls == 1:
+                    doc_path.write_text(gen2_text, encoding="utf-8")
+                    s2 = self._run_cli_ingest(
+                        data_dir=data_dir,
+                        lancedb_dir=lancedb_dir,
+                        tantivy_dir=tantivy_dir,
+                        lance_table=table_name,
+                        reset=False,
+                    )
+                    self.assertEqual(s2["generation"], 2)
+                    self.assertEqual(s2["total_chunks"], 1)
+                return real_tantivy_index(*args, **kwargs)
+
+            with mock.patch.object(
+                rag_server.tantivy, "Index", side_effect=pause_once_before_tantivy
+            ):
+                rag_server.configure_offline_runtime(
+                    lancedb_path=lancedb_dir,
+                    tantivy_path=tantivy_dir,
+                    lance_table_name=table_name,
+                )
+
+            self.assertEqual(
+                open_calls,
+                2,
+                "Expected attempt 1 torn handles to be discarded and attempt 2 to succeed cleanly",
+            )
+            self.assertEqual(rag_server.loaded_generation, 2)
+
+            client = TestClient(rag_server.app)
+            debug_resp = client.post(
+                "/search/debug",
+                json={"query": "shared protocol ledger revision", "top_k": 5},
+            )
+            self.assertEqual(debug_resp.status_code, 200)
+            debug_body = debug_resp.json()
+            self.assertEqual(len(debug_body["stages"]["dense"]), 1)
+            self.assertEqual(len(debug_body["stages"]["bm25"]), 1)
+            self.assertEqual(debug_body["stages"]["dense"][0]["text"], gen2_text)
+            self.assertEqual(debug_body["stages"]["bm25"][0]["text"], gen2_text)
+            self.assertEqual(debug_body["results"][0]["text"], gen2_text)
+
+            search_resp = client.post(
+                "/search",
+                json={"query": "shared protocol ledger revision", "top_k": 5},
+            )
+            self.assertEqual(search_resp.status_code, 200)
+            self.assertEqual(search_resp.json()["results"][0]["text"], gen2_text)
+
+            # Old gen-1 unique terms must not leak from a stale dense handle.
+            stale_resp = client.post(
+                "/search/debug",
+                json={"query": "alpha glacier", "top_k": 5},
+            )
+            self.assertEqual(stale_resp.status_code, 200)
+            for stage in ("dense", "bm25", "final"):
+                for item in stale_resp.json()["stages"][stage]:
+                    self.assertNotIn("alpha glacier", item["text"])
+
+            # Part B: Reopen triggered directly by ASGI /search/debug when disk moves 2 -> 3
+            # and a real CLI commit advances 3 -> 4 (same count) mid-open.
+            doc_path.write_text(gen3_text, encoding="utf-8")
+            s3 = self._run_cli_ingest(
+                data_dir=data_dir,
+                lancedb_dir=lancedb_dir,
+                tantivy_dir=tantivy_dir,
+                lance_table=table_name,
+                reset=False,
+            )
+            self.assertEqual(s3["generation"], 3)
+            self.assertEqual(s3["total_chunks"], 1)
+
+            reopen_calls = 0
+
+            def pause_once_on_live_reopen(*args, **kwargs):
+                nonlocal reopen_calls
+                reopen_calls += 1
+                if reopen_calls == 1:
+                    doc_path.write_text(gen4_text, encoding="utf-8")
+                    s4 = self._run_cli_ingest(
+                        data_dir=data_dir,
+                        lancedb_dir=lancedb_dir,
+                        tantivy_dir=tantivy_dir,
+                        lance_table=table_name,
+                        reset=False,
+                    )
+                    self.assertEqual(s4["generation"], 4)
+                    self.assertEqual(s4["total_chunks"], 1)
+                return real_tantivy_index(*args, **kwargs)
+
+            with mock.patch.object(
+                rag_server.tantivy, "Index", side_effect=pause_once_on_live_reopen
+            ):
+                live_debug = client.post(
+                    "/search/debug",
+                    json={"query": "shared protocol ledger revision", "top_k": 5},
+                )
+            self.assertEqual(live_debug.status_code, 200)
+            self.assertEqual(reopen_calls, 2)
+            self.assertEqual(rag_server.loaded_generation, 4)
+            live_body = live_debug.json()
+            self.assertEqual(live_body["stages"]["dense"][0]["text"], gen4_text)
+            self.assertEqual(live_body["stages"]["bm25"][0]["text"], gen4_text)
+            self.assertEqual(live_body["results"][0]["text"], gen4_text)
+
+            live_search = client.post(
+                "/search",
+                json={"query": "shared protocol ledger revision", "top_k": 5},
+            )
+            self.assertEqual(live_search.status_code, 200)
+            self.assertEqual(live_search.json()["results"][0]["text"], gen4_text)
+
+    def test_mid_open_active_writer_fails_closed_with_503_never_serving_mixed_generations(
+        self,
+    ) -> None:
+        with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            (data_dir / "notes").mkdir(parents=True)
+            doc_path = data_dir / "notes" / "policy.md"
+            lancedb_dir = str(Path(tmpdir) / "lancedb")
+            tantivy_dir = str(Path(tmpdir) / "tantivy")
+            table_name = "rag09_503"
+
+            gen1_text = "Shared protocol ledger alpha glacier revision one."
+            gen2_text = "Shared protocol ledger beta volcano revision two."
+            gen3_text = "Shared protocol ledger gamma nebula revision three."
+
+            doc_path.write_text(gen1_text, encoding="utf-8")
+            self._run_cli_ingest(
+                data_dir=data_dir,
+                lancedb_dir=lancedb_dir,
+                tantivy_dir=tantivy_dir,
+                lance_table=table_name,
+                reset=True,
+            )
+
+            rag_server.INDEX_OPEN_MAX_ATTEMPTS = 2
+            rag_server.INDEX_OPEN_RETRY_DELAY_S = 0.005
+            rag_server.configure_offline_runtime(
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name=table_name,
+            )
+            self.assertEqual(rag_server.loaded_generation, 1)
+            client = TestClient(rag_server.app)
+
+            # Advance disk to generation 2 so the server must reopen.
+            doc_path.write_text(gen2_text, encoding="utf-8")
+            s2 = self._run_cli_ingest(
+                data_dir=data_dir,
+                lancedb_dir=lancedb_dir,
+                tantivy_dir=tantivy_dir,
+                lance_table=table_name,
+                reset=False,
+            )
+            self.assertEqual(s2["generation"], 2)
+            self.assertEqual(s2["total_chunks"], 1)
+
+            # Case 1: Writer starts mid-open and leaves .ingest_journal.json active.
+            # Server MUST discard torn handles, keep loaded_generation at 1, and fail closed with 503.
+            real_tantivy_index = rag_server.tantivy.Index
+            jpath = rag_common.journal_file_path(lancedb_dir)
+
+            def start_active_writer_mid_open(*args, **kwargs):
+                if not os.path.exists(jpath):
+                    rag_common.write_json_atomic(
+                        jpath,
+                        {"generation": 3, "mode": "incremental", "state": "in_progress"},
+                    )
+                return real_tantivy_index(*args, **kwargs)
+
+            with mock.patch.object(
+                rag_server.tantivy, "Index", side_effect=start_active_writer_mid_open
+            ):
+                blocked_debug = client.post(
+                    "/search/debug",
+                    json={"query": "shared protocol ledger revision", "top_k": 5},
+                )
+                blocked_search = client.post(
+                    "/search",
+                    json={"query": "shared protocol ledger revision", "top_k": 5},
+                )
+                blocked_health = client.get("/health")
+                blocked_ready = client.get("/ready")
+
+            self.assertEqual(blocked_debug.status_code, 503)
+            self.assertEqual(blocked_search.status_code, 503)
+            self.assertEqual(blocked_health.status_code, 503)
+            self.assertEqual(blocked_ready.status_code, 503)
+            self.assertEqual(rag_server.loaded_generation, 1)
+
+            # Once the pending journal clears, reader cleanly binds generation 2.
+            os.unlink(jpath)
+            recovered = client.post(
+                "/search/debug",
+                json={"query": "shared protocol ledger revision", "top_k": 5},
+            )
+            self.assertEqual(recovered.status_code, 200)
+            self.assertEqual(rag_server.loaded_generation, 2)
+            self.assertEqual(recovered.json()["stages"]["dense"][0]["text"], gen2_text)
+            self.assertEqual(recovered.json()["stages"]["bm25"][0]["text"], gen2_text)
+
+            # Case 2: Continuous equal-count commits on every retry attempt exhaust
+            # INDEX_OPEN_MAX_ATTEMPTS. Server MUST fail closed with 503 and NEVER
+            # label torn handles with the newer generation.
+            doc_path.write_text(gen3_text, encoding="utf-8")
+            s3 = self._run_cli_ingest(
+                data_dir=data_dir,
+                lancedb_dir=lancedb_dir,
+                tantivy_dir=tantivy_dir,
+                lance_table=table_name,
+                reset=False,
+            )
+            self.assertEqual(s3["generation"], 3)
+
+            churn_counter = 0
+
+            def always_commit_new_generation_mid_open(*args, **kwargs):
+                nonlocal churn_counter
+                churn_counter += 1
+                doc_path.write_text(
+                    f"Shared protocol ledger churn cycle {churn_counter} revision.",
+                    encoding="utf-8",
+                )
+                summary = self._run_cli_ingest(
+                    data_dir=data_dir,
+                    lancedb_dir=lancedb_dir,
+                    tantivy_dir=tantivy_dir,
+                    lance_table=table_name,
+                    reset=False,
+                )
+                self.assertEqual(summary["total_chunks"], 1)
+                return real_tantivy_index(*args, **kwargs)
+
+            with mock.patch.object(
+                rag_server.tantivy, "Index", side_effect=always_commit_new_generation_mid_open
+            ):
+                churn_debug = client.post(
+                    "/search/debug",
+                    json={"query": "shared protocol ledger revision", "top_k": 5},
+                )
+                churn_search = client.post(
+                    "/search",
+                    json={"query": "shared protocol ledger revision", "top_k": 5},
+                )
+                churn_ready = client.get("/ready")
+
+            self.assertEqual(churn_debug.status_code, 503)
+            self.assertEqual(churn_search.status_code, 503)
+            self.assertEqual(churn_ready.status_code, 503)
+            self.assertEqual(
+                rag_server.loaded_generation,
+                2,
+                "Exhausted reopen must never advance loaded_generation onto torn handles",
+            )
+
+            # Once writer churn stops, next request binds the final clean generation consistently.
+            final_gen = 3 + churn_counter
+            final_text = f"Shared protocol ledger churn cycle {churn_counter} revision."
+            settled = client.post(
+                "/search/debug",
+                json={"query": "shared protocol ledger revision", "top_k": 5},
+            )
+            self.assertEqual(settled.status_code, 200)
+            self.assertEqual(rag_server.loaded_generation, final_gen)
+            settled_body = settled.json()
+            self.assertEqual(settled_body["stages"]["dense"][0]["text"], final_text)
+            self.assertEqual(settled_body["stages"]["bm25"][0]["text"], final_text)
+            self.assertEqual(settled_body["results"][0]["text"], final_text)
 
 
 class TestOfflineDemoFixture(unittest.TestCase):
