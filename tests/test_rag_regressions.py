@@ -241,17 +241,29 @@ class TestRAG01ReconciliationAndCrashRecovery(unittest.TestCase):
                         reset=False,
                     )
 
-            # Journal must remain on disk and fail readiness checks.
+            # Journal must remain on disk and fail readiness AND search endpoints closed (503)
+            # so mixed new-dense + old-sparse generations are NEVER served.
             self.assertTrue(os.path.isfile(rag_common.journal_file_path(lancedb_dir)))
             rag_server.configure_offline_runtime(
                 lancedb_path=lancedb_dir,
                 tantivy_path=tantivy_dir,
                 lance_table_name="test_rag",
             )
+            rag_server._refresh_indexes()  # must refuse to refresh while journal is pending
             client = TestClient(rag_server.app)
             unhealthy = client.get("/health")
             self.assertEqual(unhealthy.status_code, 503)
             self.assertIn("journal", unhealthy.json()["reason"].lower())
+            self.assertEqual(client.get("/ready").status_code, 503)
+
+            for endpoint in ("/search", "/search/debug"):
+                blocked = client.post(endpoint, json={"query": "phoenix keyword", "top_k": 5})
+                self.assertEqual(
+                    blocked.status_code,
+                    503,
+                    f"{endpoint} must fail closed with 503 while journal is pending",
+                )
+                self.assertIn("journal", blocked.json()["detail"].lower())
 
             # Re-running ingest replays the interrupted transaction cleanly with zero duplicates.
             recovered = ingest_mod.ingest(
@@ -270,10 +282,14 @@ class TestRAG01ReconciliationAndCrashRecovery(unittest.TestCase):
             self.assertEqual(healthy.status_code, 200)
             self.assertEqual(healthy.json()["indexes"], {"lancedb": 1, "tantivy": 1})
 
-            res = client.post("/search", json={"query": "phoenix keyword", "top_k": 5}).json()
-            self.assertEqual([r["doc_id"] for r in res["results"]], ["notes/a.md"])
+            s_resp = client.post("/search", json={"query": "phoenix keyword", "top_k": 5})
+            d_resp = client.post("/search/debug", json={"query": "phoenix keyword", "top_k": 5})
+            self.assertEqual(s_resp.status_code, 200)
+            self.assertEqual(d_resp.status_code, 200)
+            self.assertEqual([r["doc_id"] for r in s_resp.json()["results"]], ["notes/a.md"])
+            self.assertEqual([r["doc_id"] for r in d_resp.json()["results"]], ["notes/a.md"])
 
-    def test_generation_mismatch_fails_health_and_recovers(self) -> None:
+    def test_generation_and_chunk_count_mismatch_fail_search_and_recover(self) -> None:
         with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir) / "data"
             (data_dir / "notes").mkdir(parents=True)
@@ -290,7 +306,7 @@ class TestRAG01ReconciliationAndCrashRecovery(unittest.TestCase):
                 embed_backend="offline",
                 reset=True,
             )
-            # Corrupt Tantivy generation marker to simulate store divergence.
+            # Case A: Corrupt Tantivy generation marker to simulate generation divergence.
             rag_common.write_json_atomic(
                 rag_common.generation_marker_path(tantivy_dir),
                 {"generation": 999, "chunk_count": 1, "lance_table": "test_rag"},
@@ -305,6 +321,21 @@ class TestRAG01ReconciliationAndCrashRecovery(unittest.TestCase):
             resp = client.get("/ready")
             self.assertEqual(resp.status_code, 503)
             self.assertIn("mismatch", resp.json()["reason"].lower())
+            for endpoint in ("/search", "/search/debug"):
+                blocked = client.post(endpoint, json={"query": "single test doc", "top_k": 5})
+                self.assertEqual(blocked.status_code, 503)
+                self.assertIn("mismatch", blocked.json()["detail"].lower())
+
+            # Case B: Same generation number but disagreeing chunk_count markers.
+            rag_common.write_json_atomic(
+                rag_common.generation_marker_path(tantivy_dir),
+                {"generation": 1, "chunk_count": 7, "lance_table": "test_rag"},
+            )
+            self.assertEqual(client.get("/ready").status_code, 503)
+            for endpoint in ("/search", "/search/debug"):
+                blocked = client.post(endpoint, json={"query": "single test doc", "top_k": 5})
+                self.assertEqual(blocked.status_code, 503)
+                self.assertIn("chunk_count", blocked.json()["detail"].lower())
 
             recovered = ingest_mod.ingest(
                 data_dir=str(data_dir),
@@ -317,6 +348,106 @@ class TestRAG01ReconciliationAndCrashRecovery(unittest.TestCase):
             self.assertTrue(recovered["recovered_from_journal"])
             rag_server._refresh_indexes()
             self.assertEqual(client.get("/ready").status_code, 200)
+            self.assertEqual(
+                client.post("/search", json={"query": "single test doc", "top_k": 5}).status_code,
+                200,
+            )
+            self.assertEqual(
+                client.post("/search/debug", json={"query": "single test doc", "top_k": 5}).status_code,
+                200,
+            )
+
+    def test_short_and_mismatched_embedding_batches_rejected_preserving_journal(self) -> None:
+        with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            (data_dir / "notes").mkdir(parents=True)
+            (data_dir / "notes" / "first.md").write_text(
+                "First document for embedding cardinality validation.", encoding="utf-8"
+            )
+            (data_dir / "notes" / "second.md").write_text(
+                "Second document for embedding cardinality validation.", encoding="utf-8"
+            )
+
+            lancedb_dir = str(Path(tmpdir) / "lancedb")
+            tantivy_dir = str(Path(tmpdir) / "tantivy")
+
+            # Short batch: 1 vector returned for 2 chunks must fail BEFORE touching either store,
+            # leaving .ingest_journal.json on disk and zero partial dense/sparse rows.
+            with mock.patch.object(
+                ingest_mod,
+                "embed_texts",
+                return_value=[[0.1, 0.2, 0.3, 0.4]],
+            ):
+                with self.assertRaisesRegex(ValueError, "Embedding count mismatch"):
+                    ingest_mod.ingest(
+                        data_dir=str(data_dir),
+                        lancedb_path=lancedb_dir,
+                        tantivy_path=tantivy_dir,
+                        lance_table_name="card_test",
+                        embed_backend="offline",
+                        reset=True,
+                    )
+
+            self.assertTrue(os.path.isfile(rag_common.journal_file_path(lancedb_dir)))
+            db = lancedb.connect(lancedb_dir)
+            self.assertNotIn("card_test", rag_common.lance_table_names(db))
+            self.assertFalse(os.path.exists(tantivy_dir))
+
+            # Non-finite vector elements are also rejected before mutating stores.
+            with mock.patch.object(
+                ingest_mod,
+                "embed_texts",
+                return_value=[[0.1, float("nan")], [0.2, 0.3]],
+            ):
+                with self.assertRaisesRegex(ValueError, "non-finite"):
+                    ingest_mod.ingest(
+                        data_dir=str(data_dir),
+                        lancedb_path=lancedb_dir,
+                        tantivy_path=tantivy_dir,
+                        lance_table_name="card_test",
+                        embed_backend="offline",
+                        reset=True,
+                    )
+            self.assertTrue(os.path.isfile(rag_common.journal_file_path(lancedb_dir)))
+
+            # Recovery with a valid offline embedder reconciles cleanly and clears the journal.
+            recovered = ingest_mod.ingest(
+                data_dir=str(data_dir),
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name="card_test",
+                embed_backend="offline",
+                reset=False,
+            )
+            self.assertTrue(recovered["recovered_from_journal"])
+            self.assertEqual(recovered["total_chunks"], 2)
+            self.assertFalse(os.path.isfile(rag_common.journal_file_path(lancedb_dir)))
+
+            # Dimension mismatch on incremental append must fail before mutating either store,
+            # preserve the journal, and keep existing dense/sparse counts equal (2 vs 2).
+            (data_dir / "notes" / "third.md").write_text(
+                "Third document whose embedding has wrong vector dimension.", encoding="utf-8"
+            )
+            with mock.patch.object(
+                ingest_mod,
+                "embed_texts",
+                return_value=[[0.1, 0.2, 0.3]],  # 3d instead of existing 256d table
+            ):
+                with self.assertRaisesRegex(ValueError, "dimension mismatch"):
+                    ingest_mod.ingest(
+                        data_dir=str(data_dir),
+                        lancedb_path=lancedb_dir,
+                        tantivy_path=tantivy_dir,
+                        lance_table_name="card_test",
+                        embed_backend="offline",
+                        reset=False,
+                    )
+
+            self.assertTrue(os.path.isfile(rag_common.journal_file_path(lancedb_dir)))
+            self.assertEqual(db.open_table("card_test").count_rows(), 2)
+            t_idx = tantivy.Index(rag_common.build_tantivy_schema(tantivy), path=tantivy_dir)
+            t_idx.reload()
+            self.assertEqual(t_idx.searcher().num_docs, 2)
 
 
 class TestRAG02UnifiedSearchAndEval(unittest.TestCase):
@@ -665,6 +796,171 @@ class TestRAG04IdentityAndDiversification(unittest.TestCase):
         self.assertAlmostEqual(scores["dup"], 1.0 / 61.0, places=9)
         self.assertAlmostEqual(scores["other"], 1.0 / 62.0 + 1.0 / 61.0, places=9)
 
+    def test_legacy_v1_schema_migrates_cleanly_on_incremental_edit_without_reset(self) -> None:
+        with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            (data_dir / "notes").mkdir(parents=True)
+            (data_dir / "docs").mkdir(parents=True)
+            doc_a = data_dir / "notes" / "alpha.md"
+            doc_b = data_dir / "docs" / "vendor_guide.md"
+            doc_a.write_text("Legacy baseline alpha passage.", encoding="utf-8")
+            doc_b.write_text("Legacy baseline vendor reference guide.", encoding="utf-8")
+
+            lancedb_dir = str(Path(tmpdir) / "lancedb")
+            tantivy_dir = str(Path(tmpdir) / "tantivy")
+            os.makedirs(lancedb_dir, exist_ok=True)
+            os.makedirs(tantivy_dir, exist_ok=True)
+
+            # Construct an authentic legacy v1 index (missing doc_id & source_class,
+            # default Tantivy tokenizers on id/domain, flat v1 manifest, no .generation.json).
+            embedder = rag_common.OfflineHashEmbedder()
+            vecs = embedder.encode(
+                ["Legacy baseline alpha passage.", "Legacy baseline vendor reference guide."]
+            ).tolist()
+            db = lancedb.connect(lancedb_dir)
+            db.create_table(
+                "legacy_rag",
+                data=[
+                    {
+                        "id": "legacy_id_a",
+                        "text": "Legacy baseline alpha passage.",
+                        "domain": "notes",
+                        "filename": "alpha.md",
+                        "url": "",
+                        "source": "notes/alpha.md",
+                        "format": "md",
+                        "chunk_index": 0,
+                        "vector": vecs[0],
+                    },
+                    {
+                        "id": "legacy_id_b",
+                        "text": "Legacy baseline vendor reference guide.",
+                        "domain": "docs",
+                        "filename": "vendor_guide.md",
+                        "url": "",
+                        "source": "docs/vendor_guide.md",
+                        "format": "md",
+                        "chunk_index": 0,
+                        "vector": vecs[1],
+                    },
+                ],
+                mode="overwrite",
+            )
+
+            sb = tantivy.SchemaBuilder()
+            sb.add_text_field("id", stored=True)
+            sb.add_text_field("text", stored=True, tokenizer_name="en_stem")
+            sb.add_text_field("domain", stored=True)
+            sb.add_text_field("filename", stored=True)
+            sb.add_text_field("url", stored=True)
+            sb.add_text_field("source", stored=True)
+            legacy_t_idx = tantivy.Index(sb.build(), path=tantivy_dir)
+            writer = legacy_t_idx.writer()
+            writer.add_document(
+                tantivy.Document(
+                    id="legacy_id_a",
+                    text="Legacy baseline alpha passage.",
+                    domain="notes",
+                    filename="alpha.md",
+                    url="",
+                    source="notes/alpha.md",
+                )
+            )
+            writer.add_document(
+                tantivy.Document(
+                    id="legacy_id_b",
+                    text="Legacy baseline vendor reference guide.",
+                    domain="docs",
+                    filename="vendor_guide.md",
+                    url="",
+                    source="docs/vendor_guide.md",
+                )
+            )
+            writer.commit()
+            writer.wait_merging_threads()
+            del writer, legacy_t_idx
+
+            # Write legacy v1 flat manifest.
+            fp_a = ingest_mod._file_fingerprint(str(doc_a))
+            fp_b = ingest_mod._file_fingerprint(str(doc_b))
+            rag_common.write_json_atomic(
+                os.path.join(lancedb_dir, rag_common.MANIFEST_FILENAME),
+                {
+                    "notes/alpha.md": {**fp_a, "chunk_ids": ["legacy_id_a"]},
+                    "docs/vendor_guide.md": {**fp_b, "chunk_ids": ["legacy_id_b"]},
+                },
+            )
+
+            # Edit one file on top of the legacy index.
+            doc_a.write_text(
+                "Updated alpha passage with migrated zenith telemetry.", encoding="utf-8"
+            )
+
+            # Dry run detects required schema migration without mutating stores.
+            dry = ingest_mod.ingest(
+                data_dir=str(data_dir),
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name="legacy_rag",
+                embed_backend="offline",
+                reset=False,
+                dry_run=True,
+            )
+            self.assertTrue(dry["schema_migration_required"])
+            self.assertFalse(dry["schema_migrated"])
+            self.assertIn("doc_id", " ".join(dry["schema_migration_reasons"]))
+
+            # Incremental ingest (reset=False) safely migrates both stores without crashing.
+            migrated = ingest_mod.ingest(
+                data_dir=str(data_dir),
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name="legacy_rag",
+                embed_backend="offline",
+                reset=False,
+            )
+            self.assertTrue(migrated["schema_migrated"])
+            self.assertEqual(migrated["total_chunks"], 2)
+            self.assertFalse(os.path.isfile(rag_common.journal_file_path(lancedb_dir)))
+
+            # Verify migrated LanceDB and Tantivy schemas are now fully v2-compliant.
+            migrated_table = lancedb.connect(lancedb_dir).open_table("legacy_rag")
+            lance_issues, _ = rag_common.inspect_lance_table_schema(migrated_table)
+            self.assertEqual(lance_issues, [])
+            self.assertEqual(rag_common.inspect_tantivy_meta_schema(tantivy_dir), [])
+
+            rag_server.configure_offline_runtime(
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name="legacy_rag",
+            )
+            client = TestClient(rag_server.app)
+            self.assertEqual(client.get("/ready").status_code, 200)
+            res = client.post(
+                "/search", json={"query": "migrated zenith telemetry", "top_k": 5}
+            )
+            self.assertEqual(res.status_code, 200)
+            top = res.json()["results"][0]
+            self.assertEqual(top["doc_id"], "notes/alpha.md")
+            self.assertEqual(top["source_class"], "curated")
+
+            # Subsequent incremental edit runs normally without triggering another migration.
+            doc_a.write_text(
+                "Second edit on migrated schema with solstice signal.", encoding="utf-8"
+            )
+            followup = ingest_mod.ingest(
+                data_dir=str(data_dir),
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name="legacy_rag",
+                embed_backend="offline",
+                reset=False,
+            )
+            self.assertFalse(followup["schema_migrated"])
+            self.assertFalse(followup["reset"])
+            self.assertEqual(followup["files_ingested"], 1)
+            self.assertEqual(followup["total_chunks"], 2)
+
 
 class TestRAG05VendorClassAndRecency(unittest.TestCase):
     """RAG-05: explicit source_class persisted at ingest + real fast-path recency tie-break."""
@@ -893,6 +1189,26 @@ class TestOfflineDemoFixture(unittest.TestCase):
         self.assertEqual(result["parity_checks_passed"], result["eval"]["total_queries"])
         self.assertEqual(result["reconcile"]["remaining_lancedb"], result["reconcile"]["remaining_tantivy"])
         self.assertEqual(result["metrics_contract"], "ok")
+
+    def test_quickstart_dependency_manifests_include_required_packages(self) -> None:
+        required = {
+            "fastapi",
+            "uvicorn",
+            "pydantic",
+            "lancedb",
+            "tantivy",
+            "prometheus-client",
+            "requests",
+            "httpx",
+        }
+        for filename in ("requirements-offline.txt", "requirements.txt"):
+            text = (REPO_ROOT / filename).read_text(encoding="utf-8").lower()
+            for pkg in required:
+                self.assertIn(pkg, text, f"{filename} is missing required dependency '{pkg}'")
+        readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8").lower()
+        self.assertIn("requirements-offline.txt", readme_text)
+        for pkg in ("requests", "prometheus-client", "httpx"):
+            self.assertIn(pkg, readme_text, f"README.md missing dependency '{pkg}'")
 
 
 if __name__ == "__main__":

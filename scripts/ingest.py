@@ -19,12 +19,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import sys
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 RAG_ROOT = os.environ.get(
     "RAG_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +44,8 @@ from rag_common import (  # noqa: E402
     classify_source_path,
     clean_chunk_text,
     generation_marker_path,
+    inspect_lance_table_schema,
+    inspect_tantivy_meta_schema,
     journal_file_path,
     lance_table_names,
     normalize_rel_path,
@@ -254,6 +258,55 @@ def build_chunks_for_file(
     return chunks
 
 
+def _validate_embeddings(
+    vectors: Any,
+    expected_count: int,
+    expected_dim: int | None = None,
+) -> list[list[float]]:
+    """Validate embedding cardinality, finite numeric values, and uniform vector dimension."""
+    if not isinstance(vectors, (list, tuple)):
+        raise ValueError(
+            f"Embedding backend returned invalid payload type {type(vectors).__name__}; expected list of vectors"
+        )
+    if len(vectors) != expected_count:
+        raise ValueError(
+            f"Embedding count mismatch: expected {expected_count} vectors, got {len(vectors)}"
+        )
+    if expected_count == 0:
+        return []
+
+    validated: list[list[float]] = []
+    dim: int | None = expected_dim
+    for idx, raw_vec in enumerate(vectors):
+        if hasattr(raw_vec, "tolist") and not isinstance(raw_vec, (list, tuple)):
+            raw_vec = raw_vec.tolist()
+        if not isinstance(raw_vec, (list, tuple)) or len(raw_vec) == 0:
+            raise ValueError(
+                f"Embedding vector at index {idx} must be a non-empty sequence of finite floats"
+            )
+        vec_len = len(raw_vec)
+        if dim is None:
+            dim = vec_len
+        elif vec_len != dim:
+            raise ValueError(
+                f"Embedding dimension mismatch at index {idx}: expected {dim}, got {vec_len}"
+            )
+        clean_vec: list[float] = []
+        for val in raw_vec:
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise ValueError(
+                    f"Embedding vector at index {idx} contains non-numeric value {val!r}"
+                )
+            fval = float(val)
+            if not math.isfinite(fval):
+                raise ValueError(
+                    f"Embedding vector at index {idx} contains non-finite value {val!r}"
+                )
+            clean_vec.append(fval)
+        validated.append(clean_vec)
+    return validated
+
+
 def _embed_via_http(
     texts: list[str],
     embed_url: str,
@@ -267,6 +320,7 @@ def _embed_via_http(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     vectors: list[list[float]] = []
+    batch_dim: int | None = None
     for start in range(0, len(texts), batch_size):
         batch = texts[start : start + batch_size]
         req = urllib.request.Request(
@@ -277,7 +331,14 @@ def _embed_via_http(
         )
         with urllib.request.urlopen(req, timeout=300) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
-        vectors.extend(payload["embeddings"])
+        if not isinstance(payload, dict) or "embeddings" not in payload:
+            raise ValueError("HTTP /embed response missing 'embeddings' field")
+        batch_vecs = _validate_embeddings(
+            payload["embeddings"], expected_count=len(batch), expected_dim=batch_dim
+        )
+        if batch_vecs and batch_dim is None:
+            batch_dim = len(batch_vecs[0])
+        vectors.extend(batch_vecs)
     return vectors
 
 
@@ -427,6 +488,91 @@ def _remove_journal(lancedb_path: str) -> None:
         pass
 
 
+def _detect_legacy_schema(
+    lancedb_path: str,
+    tantivy_path: str,
+    lance_table_name: str,
+    raw_manifest: dict | None,
+) -> tuple[bool, list[str], int | None]:
+    """Preflight check for legacy v1 manifest/LanceDB/Tantivy schemas.
+
+    Returns (needs_migration, reasons, existing_vector_dim). Detects missing
+    v2 columns/fields such as `doc_id` and `source_class` or legacy non-raw
+    Tantivy tokenizers before any incremental mutation runs.
+    """
+    reasons: list[str] = []
+    existing_vector_dim: int | None = None
+
+    if raw_manifest is not None and (
+        raw_manifest.get("schema_version") != 2
+        or not isinstance(raw_manifest.get("files"), dict)
+    ):
+        reasons.append("Manifest uses legacy v1 format (missing schema_version=2)")
+
+    reasons.extend(inspect_tantivy_meta_schema(tantivy_path))
+
+    if os.path.isdir(lancedb_path):
+        try:
+            import lancedb
+
+            db = lancedb.connect(lancedb_path)
+            if lance_table_name in lance_table_names(db) and hasattr(db, "open_table"):
+                table = db.open_table(lance_table_name)
+                lance_reasons, existing_vector_dim = inspect_lance_table_schema(table)
+                reasons.extend(lance_reasons)
+        except Exception:
+            pass
+
+    return bool(reasons), reasons, existing_vector_dim
+
+
+def _verify_committed_counts(
+    db: Any,
+    lance_table_name: str,
+    tantivy_index_or_path: Any,
+    tantivy_mod: Any,
+    tantivy_schema: Any,
+    expected_count: int,
+) -> None:
+    """Verify both real LanceDB and Tantivy stores match expected_count before
+    writing generation markers and clearing `.ingest_journal.json`.
+    """
+    tables = lance_table_names(db)
+    if hasattr(db, "open_table"):
+        if expected_count == 0:
+            if lance_table_name in tables:
+                tbl = db.open_table(lance_table_name)
+                if hasattr(tbl, "count_rows"):
+                    actual_lance = int(tbl.count_rows())
+                    if actual_lance != 0:
+                        raise RuntimeError(
+                            f"Post-commit LanceDB count mismatch: expected 0, got {actual_lance}"
+                        )
+        else:
+            if lance_table_name not in tables:
+                raise RuntimeError(
+                    f"Post-commit LanceDB table '{lance_table_name}' missing (expected {expected_count} rows)"
+                )
+            tbl = db.open_table(lance_table_name)
+            if hasattr(tbl, "count_rows"):
+                actual_lance = int(tbl.count_rows())
+                if actual_lance != expected_count:
+                    raise RuntimeError(
+                        f"Post-commit LanceDB count mismatch: expected {expected_count}, got {actual_lance}"
+                    )
+
+    t_idx = tantivy_index_or_path
+    if isinstance(t_idx, str):
+        t_idx = tantivy_mod.Index(tantivy_schema, path=t_idx)
+    if t_idx is not None and hasattr(t_idx, "reload") and hasattr(t_idx, "searcher"):
+        t_idx.reload()
+        actual_tantivy = int(t_idx.searcher().num_docs)
+        if actual_tantivy != expected_count:
+            raise RuntimeError(
+                f"Post-commit Tantivy count mismatch: expected {expected_count}, got {actual_tantivy}"
+            )
+
+
 def ingest(
     data_dir: str = DEFAULT_DATA_DIR,
     lancedb_path: str = DEFAULT_LANCEDB_PATH,
@@ -447,10 +593,13 @@ def ingest(
     """Ingest documents from data_dir into LanceDB and Tantivy with dual-store parity.
 
     Reconciles added, modified, emptied, and deleted files across both LanceDB
-    and Tantivy, coordinates resets via validated staging, writes matching
-    generation markers, and replays interrupted updates from `.ingest_journal.json`.
+    and Tantivy, detects and safely migrates legacy v1 schemas via staged
+    rebuild, validates embedding cardinality/dimensions before mutating either
+    store, coordinates resets via validated staging, writes matching generation
+    markers, and replays interrupted updates from `.ingest_journal.json`.
     """
     files = discover_documents(data_dir)
+    raw_manifest = read_json_optional(_manifest_path(lancedb_path))
     manifest_state = _load_manifest(lancedb_path)
     prev_generation = int(manifest_state.get("generation", 0))
 
@@ -459,16 +608,30 @@ def ingest(
     tantivy_gen = read_json_optional(generation_marker_path(tantivy_path))
 
     recovered_from_journal = False
+    schema_migrated = False
     effective_reset = bool(reset)
     recovery_forced_keys: set[str] = set()
     recovery_stale_ids: list[str] = []
 
+    needs_schema_migration, legacy_reasons, existing_vector_dim = (
+        (False, [], None)
+        if effective_reset
+        else _detect_legacy_schema(lancedb_path, tantivy_path, lance_table_name, raw_manifest)
+    )
+
     if not dry_run:
+        if needs_schema_migration and not effective_reset:
+            # Stage a clean full rebuild to migrate legacy v1 LanceDB/Tantivy schemas
+            # (missing doc_id/source_class or legacy Tantivy tokenizers) safely.
+            schema_migrated = True
+            effective_reset = True
+            existing_vector_dim = None
         if journal is not None:
             recovered_from_journal = True
             if journal.get("mode") == "reset":
                 effective_reset = True
-            else:
+                existing_vector_dim = None
+            elif not effective_reset:
                 recovery_forced_keys.update(journal.get("pending_files", []))
                 recovery_stale_ids.extend(journal.get("stale_ids", []))
                 recovery_stale_ids.extend(journal.get("new_ids", []))
@@ -479,11 +642,13 @@ def ingest(
                 lance_gen is None
                 or tantivy_gen is None
                 or lance_gen.get("generation") != tantivy_gen.get("generation")
+                or lance_gen.get("chunk_count") != tantivy_gen.get("chunk_count")
             )
         ):
             # Stores diverged without an active journal; force a clean full rebuild.
             recovered_from_journal = True
             effective_reset = True
+            existing_vector_dim = None
 
     manifest_files: dict[str, dict] = (
         {} if effective_reset else dict(manifest_state.get("files", {}))
@@ -552,6 +717,7 @@ def ingest(
         or deleted_keys
         or pending_files
         or recovered_from_journal
+        or schema_migrated
     )
 
     # Preview total chunks after this run.
@@ -575,7 +741,11 @@ def ingest(
         "reset": effective_reset,
         "dry_run": dry_run,
         "recovered_from_journal": recovered_from_journal,
+        "schema_migrated": schema_migrated,
     }
+    if legacy_reasons:
+        summary["schema_migration_required"] = needs_schema_migration
+        summary["schema_migration_reasons"] = legacy_reasons
 
     if dry_run or not has_mutations:
         return summary
@@ -584,19 +754,20 @@ def ingest(
     import tantivy
 
     os.makedirs(lancedb_path, exist_ok=True)
-    write_json_atomic(
-        journal_file_path(lancedb_path),
-        {
-            "generation": next_generation,
-            "mode": "reset" if effective_reset else "incremental",
-            "state": "in_progress",
-            "started_at": utc_now_iso(),
-            "pending_files": [rel_key for _, rel_key, _ in pending_files],
-            "deleted_keys": deleted_keys,
-            "stale_ids": stale_ids,
-            "new_ids": new_ids,
-        },
-    )
+    journal_payload: dict[str, Any] = {
+        "generation": next_generation,
+        "mode": "reset" if effective_reset else "incremental",
+        "state": "in_progress",
+        "started_at": utc_now_iso(),
+        "pending_files": [rel_key for _, rel_key, _ in pending_files],
+        "deleted_keys": deleted_keys,
+        "stale_ids": stale_ids,
+        "new_ids": new_ids,
+    }
+    if schema_migrated:
+        journal_payload["schema_migration"] = True
+        journal_payload["schema_migration_reasons"] = legacy_reasons
+    write_json_atomic(journal_file_path(lancedb_path), journal_payload)
 
     # --- Case 1: Empty reset (zero nonempty chunks across the corpus) ---
     if effective_reset and not all_chunks:
@@ -618,6 +789,7 @@ def ingest(
         _commit_and_close_writer(writer)
         del writer
 
+        _verify_committed_counts(db, lance_table_name, t_index, tantivy, schema, 0)
         _write_generation_markers(
             lancedb_path, tantivy_path, next_generation, 0, lance_table_name
         )
@@ -633,8 +805,9 @@ def ingest(
         _remove_journal(lancedb_path)
         return summary
 
-    # Embed any new chunks before touching either store so embedding failures
-    # leave both stores clean and recoverable.
+    # Embed and strictly validate all new chunks BEFORE touching either store so
+    # cardinality or vector-dimension errors preserve the journal and leave both
+    # stores completely untouched and consistent.
     lance_rows: list[dict] = []
     if all_chunks:
         vectors = embed_texts(
@@ -647,7 +820,15 @@ def ingest(
             embed_backend=embed_backend,
             api_key=api_key,
         )
-        lance_rows = [{**chunk, "vector": vec} for chunk, vec in zip(all_chunks, vectors)]
+        validated_vectors = _validate_embeddings(
+            vectors,
+            expected_count=len(all_chunks),
+            expected_dim=None if effective_reset else existing_vector_dim,
+        )
+        lance_rows = [
+            {**chunk, "vector": vec}
+            for chunk, vec in zip(all_chunks, validated_vectors, strict=True)
+        ]
 
     db = lancedb.connect(lancedb_path)
     existing_tables = lance_table_names(db)
@@ -697,6 +878,9 @@ def ingest(
             if os.path.exists(backup_dir):
                 shutil.rmtree(backup_dir, ignore_errors=True)
 
+        _verify_committed_counts(
+            db, lance_table_name, tantivy_path, tantivy, schema, total_chunks
+        )
         _write_generation_markers(
             lancedb_path, tantivy_path, next_generation, total_chunks, lance_table_name
         )
@@ -733,6 +917,9 @@ def ingest(
     _commit_and_close_writer(writer)
     del writer
 
+    _verify_committed_counts(
+        db, lance_table_name, t_index, tantivy, schema, total_chunks
+    )
     _write_generation_markers(
         lancedb_path, tantivy_path, next_generation, total_chunks, lance_table_name
     )

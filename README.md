@@ -15,7 +15,7 @@ Running hybrid retrieval in production over a living document corpus fails in pr
 
 LanceDB and Tantivy provide the underlying vector and BM25 primitives; `alfred-rag` provides the coordination, retrieval policy, evaluation parity, and operational guardrails around them:
 
-- **Generation-tracked dual-store ingestion (`scripts/ingest.py`)**: reconciles added, edited, emptied, and deleted files across both LanceDB and Tantivy; builds resets in a validated staging directory before swapping; records a write-ahead `.ingest_journal.json` and matching `.generation.json` markers; and automatically replays interrupted updates.
+- **Generation-tracked dual-store ingestion (`scripts/ingest.py`)**: reconciles added, edited, emptied, and deleted files across both LanceDB and Tantivy; validates embedding cardinality and vector dimensions before mutating either store; automatically detects and stages safe full-rebuild migrations for legacy v1 schemas (missing `doc_id`/`source_class` or legacy Tantivy tokenizers); verifies committed row counts before clearing `.ingest_journal.json`; and fails `/health`, `/ready`, `/search`, and `/search/debug` closed (HTTP 503) whenever a journal is pending or store generations/counts disagree so mixed generations are never served.
 - **Single-pipeline serving & evaluation (`rag_server.py`, `rag_eval.py`)**: `/search` and `/search/debug` execute the exact same `_execute_search` function, guaranteeing identical IDs, ordering, and scores between production traffic and evaluation diagnostics.
 - **Canonical document identity & source classification (`rag_common.py`)**: separates stable corpus-relative `doc_id` from display `source`/`url` fields, persists explicit `source_class` (`curated` vs `vendor`) in both stores, deduplicates each RRF leg, and breaks real fast-path RRF score ties using document recency.
 - **Loopback-by-default security & bounded requests**: defaults to `127.0.0.1`, refuses non-loopback binds unless both `ALLOW_EXTERNAL_BIND=1` and `RAG_API_KEY` are set, separates full resets onto `POST /admin/ingest/reset` (`RAG_ADMIN_API_KEY`), and enforces body-size and parameter limits.
@@ -74,7 +74,9 @@ LanceDB and Tantivy provide the underlying vector and BM25 primitives; `alfred-r
 ### 1. Install lightweight CPU dependencies
 
 ```bash
-python -m pip install fastapi httpx lancedb tantivy prometheus-client requests pydantic uvicorn
+python -m pip install -r requirements-offline.txt
+# Equivalent explicit package list:
+# python -m pip install fastapi uvicorn pydantic lancedb tantivy prometheus-client requests httpx
 ```
 
 *(For full GPU serving and fine-tuning with Qwen3-8B models, install `pip install -r requirements.txt`.)*
@@ -101,7 +103,8 @@ Expected output:
     "generation": 1,
     "reset": true,
     "dry_run": false,
-    "recovered_from_journal": false
+    "recovered_from_journal": false,
+    "schema_migrated": false
   },
   "eval": {
     "total_queries": 10,
@@ -137,7 +140,9 @@ python -m unittest discover -s tests -v
 This runs unit tests plus real CPU LanceDB + Tantivy integration tests covering:
 - Incremental deletion and emptying across both stores
 - Empty `--reset` agreement across both stores (LanceDB table dropped + Tantivy 0 docs + HTTP 503 readiness)
-- Simulated crash mid-ingest (`.ingest_journal.json` fails `/health` and `/ready` with 503, then next `ingest()` replays cleanly with zero duplicates)
+- Simulated crash mid-ingest (`.ingest_journal.json` fails `/health`, `/ready`, `/search`, and `/search/debug` with 503 so mixed generations are never served, then next `ingest()` replays cleanly with zero duplicates)
+- Short or dimension-mismatched embedding batches (rejected before mutating either store, preserving `.ingest_journal.json` without partial commits)
+- Legacy v1 schema migration (indexes missing `doc_id`/`source_class` or `raw` Tantivy tokenizers are detected at preflight and safely migrated via staged rebuild on incremental ingest without requiring manual `--reset`)
 - `/search` vs `/search/debug` identity across `rerank=True` and `rerank=False`
 - Same-basename diversification (`max_per_source=1`), shared-upstream-source JSONL isolation, and per-leg RRF deduplication
 - Explicit `source_class=vendor` deprioritization and real fast-path RRF tie-breaking by recency

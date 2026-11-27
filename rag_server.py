@@ -309,6 +309,66 @@ def rrf_merge(dense_ids: list[str], bm25_ids: list[str], k: int = 60) -> list[st
     return merged_ids
 
 
+def _inspect_store_coordination() -> tuple[list[str], int | None, int | None]:
+    """Inspect on-disk journal and dual-store generation markers.
+
+    Returns (issues, committed_generation, expected_chunk_count). Any pending
+    journal or generation/chunk_count disagreement populates `issues` so both
+    health probes and search endpoints fail closed instead of serving mixed
+    generations.
+    """
+    issues: list[str] = []
+    committed_generation: int | None = None
+    expected_chunk_count: int | None = None
+
+    jpath = journal_file_path(LANCEDB_PATH)
+    if os.path.exists(jpath):
+        journal = read_json_optional(jpath)
+        gen_label = journal.get("generation") if isinstance(journal, dict) else "unknown"
+        issues.append(
+            f"Interrupted ingest journal detected (generation {gen_label}); "
+            "run ingest to reconcile"
+        )
+
+    lpath = generation_marker_path(LANCEDB_PATH)
+    tpath = generation_marker_path(TANTIVY_PATH)
+    l_exists = os.path.exists(lpath)
+    t_exists = os.path.exists(tpath)
+    lance_gen = read_json_optional(lpath)
+    tantivy_gen = read_json_optional(tpath)
+
+    if l_exists or t_exists:
+        if lance_gen is None or tantivy_gen is None:
+            issues.append(
+                "Index generation marker missing or unreadable in one store (LanceDB vs Tantivy)"
+            )
+        else:
+            lg = lance_gen.get("generation")
+            tg = tantivy_gen.get("generation")
+            lc = lance_gen.get("chunk_count")
+            tc = tantivy_gen.get("chunk_count")
+            if lg != tg:
+                issues.append(
+                    f"Index generation mismatch: LanceDB={lg} vs Tantivy={tg}"
+                )
+            if lc != tc:
+                issues.append(
+                    f"Index generation chunk_count mismatch: LanceDB={lc} vs Tantivy={tc}"
+                )
+            if lg == tg and lc == tc and lg is not None:
+                try:
+                    committed_generation = int(lg)
+                except (TypeError, ValueError):
+                    issues.append(f"Invalid index generation value: {lg!r}")
+                if lc is not None:
+                    try:
+                        expected_chunk_count = int(lc)
+                    except (TypeError, ValueError):
+                        issues.append(f"Invalid index generation chunk_count value: {lc!r}")
+
+    return issues, committed_generation, expected_chunk_count
+
+
 def _open_indexes() -> None:
     """Open or reopen LanceDB and Tantivy handles from LANCEDB_PATH / TANTIVY_PATH."""
     global lance_table, tantivy_index, loaded_generation
@@ -327,41 +387,32 @@ def _open_indexes() -> None:
         else:
             tantivy_index = None
 
-        lance_gen = read_json_optional(generation_marker_path(LANCEDB_PATH))
-        tantivy_gen = read_json_optional(generation_marker_path(TANTIVY_PATH))
-        if (
-            lance_gen
-            and tantivy_gen
-            and lance_gen.get("generation") == tantivy_gen.get("generation")
-        ):
-            loaded_generation = int(lance_gen["generation"])
-        else:
-            loaded_generation = None
+        coord_issues, committed_gen, _ = _inspect_store_coordination()
+        loaded_generation = committed_gen if not coord_issues else None
 
 
 def _refresh_indexes():
     """Pull the latest LanceDB fragments and Tantivy segments into live readers.
 
-    Detects generation changes (for example after an atomic reset swap) and
-    reopens readers when the generation marker advances.
+    Refuses to refresh while `.ingest_journal.json` is pending or generation
+    markers disagree, preventing partial/mixed generations from being exposed
+    to live readers. Reopens readers atomically when a clean new generation
+    commits.
     """
     global loaded_generation
     try:
-        lance_gen = read_json_optional(generation_marker_path(LANCEDB_PATH))
-        tantivy_gen = read_json_optional(generation_marker_path(TANTIVY_PATH))
-        disk_gen = None
-        if (
-            lance_gen
-            and tantivy_gen
-            and lance_gen.get("generation") == tantivy_gen.get("generation")
-        ):
-            disk_gen = int(lance_gen["generation"])
+        coord_issues, disk_gen, _ = _inspect_store_coordination()
+        if coord_issues:
+            return
 
         if disk_gen is not None and disk_gen != loaded_generation:
             _open_indexes()
             return
 
         with _INDEX_LOCK:
+            post_issues, _, _ = _inspect_store_coordination()
+            if post_issues:
+                return
             if lance_table is not None:
                 lance_table.checkout_latest()
             if tantivy_index is not None:
@@ -476,46 +527,39 @@ def load_models():
 
 def _collect_index_health() -> tuple[int, int, list[str], int | None]:
     """Return (lance_count, tantivy_count, issues, generation) for the loaded indexes."""
-    issues: list[str] = []
-    generation: int | None = None
+    issues, generation, expected_count = _inspect_store_coordination()
+    can_refresh = not issues
 
-    # Check on-disk journal and generation alignment if present.
-    journal = read_json_optional(journal_file_path(LANCEDB_PATH))
-    if journal is not None:
-        issues.append(
-            f"Interrupted ingest journal detected (generation {journal.get('generation')}); "
-            "run ingest to reconcile"
-        )
+    # If a new consistent generation committed on disk, rebind both readers first.
+    if can_refresh and generation is not None and generation != loaded_generation:
+        try:
+            _open_indexes()
+        except Exception as e:
+            issues.append(f"Index reopen error: {e}")
+            can_refresh = False
 
-    lance_gen = read_json_optional(generation_marker_path(LANCEDB_PATH))
-    tantivy_gen = read_json_optional(generation_marker_path(TANTIVY_PATH))
-    if lance_gen is not None or tantivy_gen is not None:
-        if lance_gen is None or tantivy_gen is None:
-            issues.append("Index generation marker missing from one store (LanceDB vs Tantivy)")
-        elif lance_gen.get("generation") != tantivy_gen.get("generation"):
-            issues.append(
-                f"Index generation mismatch: LanceDB={lance_gen.get('generation')} "
-                f"vs Tantivy={tantivy_gen.get('generation')}"
-            )
-        else:
-            generation = int(lance_gen["generation"])
-
+    lance_errored = False
     if lance_table is not None:
         try:
-            lance_table.checkout_latest()
+            if can_refresh:
+                lance_table.checkout_latest()
             lance_count = int(lance_table.count_rows())
         except Exception as e:
             lance_count = 0
+            lance_errored = True
             issues.append(f"LanceDB index error: {e}")
     else:
         lance_count = 0
 
+    tantivy_errored = False
     if tantivy_index is not None:
         try:
-            tantivy_index.reload()
+            if can_refresh:
+                tantivy_index.reload()
             tantivy_count = int(tantivy_index.searcher().num_docs)
         except Exception as e:
             tantivy_count = 0
+            tantivy_errored = True
             issues.append(f"Tantivy index error: {e}")
     else:
         tantivy_count = 0
@@ -525,7 +569,91 @@ def _collect_index_health() -> tuple[int, int, list[str], int | None]:
     if tantivy_count <= 0 and not any("Tantivy" in issue for issue in issues):
         issues.append("Tantivy index is empty (0 docs)")
 
+    if not lance_errored and not tantivy_errored:
+        if lance_table is not None and tantivy_index is not None and lance_count != tantivy_count:
+            issues.append(
+                f"Index row count mismatch: LanceDB={lance_count} vs Tantivy={tantivy_count}"
+            )
+        elif (
+            expected_count is not None
+            and generation is not None
+            and (lance_count != expected_count or tantivy_count != expected_count)
+        ):
+            issues.append(
+                f"Index count diverges from committed generation {generation}: "
+                f"expected={expected_count}, LanceDB={lance_count}, Tantivy={tantivy_count}"
+            )
+
     return lance_count, tantivy_count, issues, generation
+
+
+def _ensure_search_indexes_consistent(
+    expected_generation: int | None = None,
+) -> int | None:
+    """Gate /search and /search/debug fail-closed with HTTP 503 when dual stores
+    have a pending ingest journal or disagree on generation/chunk counts.
+    """
+    coord_issues, disk_gen, expected_count = _inspect_store_coordination()
+    if coord_issues:
+        raise HTTPException(
+            status_code=503,
+            detail="Search unavailable while indexes are inconsistent: " + "; ".join(coord_issues),
+        )
+
+    if expected_generation is not None and disk_gen != expected_generation:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Search aborted because index generation changed mid-query "
+                f"({expected_generation} -> {disk_gen}); retry request"
+            ),
+        )
+
+    # Bind both readers to a newly committed consistent generation if disk moved forward.
+    if expected_generation is None and disk_gen is not None and disk_gen != loaded_generation:
+        _open_indexes()
+        post_issues, post_gen, post_count = _inspect_store_coordination()
+        if post_issues or post_gen != disk_gen:
+            raise HTTPException(
+                status_code=503,
+                detail="Search unavailable while indexes are transitioning: "
+                + ("; ".join(post_issues) if post_issues else "generation changed"),
+            )
+        expected_count = post_count
+
+    has_lance = lance_table is not None
+    has_tantivy = tantivy_index is not None
+    if has_lance or has_tantivy or expected_count is not None:
+        try:
+            lance_count = int(lance_table.count_rows()) if has_lance else 0
+            tantivy_count = int(tantivy_index.searcher().num_docs) if has_tantivy else 0
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Search unavailable: index read error ({exc})",
+            ) from exc
+
+        if lance_count != tantivy_count:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Search unavailable: dual-store count mismatch "
+                    f"(LanceDB={lance_count} vs Tantivy={tantivy_count})"
+                ),
+            )
+        if expected_count is not None and (
+            lance_count != expected_count or tantivy_count != expected_count
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Search unavailable: loaded index counts (LanceDB={lance_count}, "
+                    f"Tantivy={tantivy_count}) disagree with committed generation "
+                    f"{disk_gen} (chunk_count={expected_count})"
+                ),
+            )
+
+    return disk_gen
 
 
 def _build_health_response(unhealthy_status: str) -> JSONResponse:
@@ -858,6 +986,10 @@ def _execute_search(req: SearchRequest, include_stages: bool = False) -> dict[st
     if req.rerank and reranker_model is None:
         raise HTTPException(status_code=503, detail="Reranker model is not loaded")
 
+    # Fail closed before touching readers if an ingest journal is pending or
+    # LanceDB / Tantivy generation or chunk counts disagree.
+    search_gen = _ensure_search_indexes_consistent()
+
     start = time.time()
     timings: dict[str, float] = {}
     stages: dict[str, list[dict]] = {}
@@ -885,6 +1017,9 @@ def _execute_search(req: SearchRequest, include_stages: bool = False) -> dict[st
     timings["bm25"] = round(time.time() - t0, 3)
     if include_stages:
         stages["bm25"] = [{**r, "rank": i + 1} for i, r in enumerate(bm25_results)]
+
+    # Re-verify no ingest started or shifted generations between dense and BM25 reads.
+    _ensure_search_indexes_consistent(expected_generation=search_gen)
 
     # 4. Deduplicated RRF fusion
     t0 = time.time()

@@ -1,0 +1,10 @@
+# Lightweight CPU-only dependencies for scripts/offline_demo.py, rag_eval.py,
+# RAG_BACKEND=offline serving, and the full unittest suite (no PyTorch/CUDA).
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+lancedb>=0.12.0
+tantivy>=0.22.0
+prometheus-client>=0.20.0
+requests>=2.31.0
+httpx>=0.27.0

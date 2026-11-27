@@ -81,6 +81,28 @@ def classify_source_path(
     return "curated"
 
 
+# --- Canonical v2 schema contracts (shared by ingest and server) ---
+REQUIRED_LANCE_COLUMNS = frozenset(
+    {
+        "id",
+        "doc_id",
+        "text",
+        "domain",
+        "filename",
+        "url",
+        "source",
+        "source_class",
+        "format",
+        "chunk_index",
+        "vector",
+    }
+)
+REQUIRED_TANTIVY_FIELDS = frozenset(
+    {"id", "doc_id", "text", "domain", "filename", "url", "source", "source_class"}
+)
+TANTIVY_RAW_FIELDS = frozenset({"id", "doc_id", "domain", "source_class"})
+
+
 def build_tantivy_schema(tantivy_mod: Any):
     """Build the canonical Tantivy schema shared by ingest and server."""
     sb = tantivy_mod.SchemaBuilder()
@@ -93,6 +115,69 @@ def build_tantivy_schema(tantivy_mod: Any):
     sb.add_text_field("source", stored=True)
     sb.add_text_field("source_class", stored=True, tokenizer_name="raw")
     return sb.build()
+
+
+def inspect_tantivy_meta_schema(tantivy_path: str) -> list[str]:
+    """Return schema incompatibility reasons for an existing Tantivy index dir.
+
+    Returns an empty list if no Tantivy index exists yet or if its schema matches
+    the current v2 contract (all required fields + raw tokenizers on identifier
+    and facet fields).
+    """
+    meta_path = os.path.join(tantivy_path, "meta.json")
+    if not os.path.isfile(meta_path):
+        return []
+    meta = read_json_optional(meta_path)
+    if not isinstance(meta, dict) or not isinstance(meta.get("schema"), list):
+        return ["Tantivy meta.json schema is unreadable"]
+
+    fields_by_name: dict[str, dict[str, Any]] = {}
+    for entry in meta["schema"]:
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+            fields_by_name[entry["name"]] = entry
+
+    reasons: list[str] = []
+    missing = sorted(REQUIRED_TANTIVY_FIELDS - set(fields_by_name.keys()))
+    if missing:
+        reasons.append(f"Tantivy schema missing fields: {', '.join(missing)}")
+
+    for fname in sorted(TANTIVY_RAW_FIELDS):
+        entry = fields_by_name.get(fname)
+        if not entry:
+            continue
+        indexing = (entry.get("options") or {}).get("indexing") or {}
+        tok = indexing.get("tokenizer")
+        if tok != "raw":
+            reasons.append(
+                f"Tantivy field '{fname}' uses tokenizer {tok!r} instead of 'raw'"
+            )
+    return reasons
+
+
+def inspect_lance_table_schema(table: Any) -> tuple[list[str], int | None]:
+    """Return (incompatibility_reasons, vector_dim) for an opened LanceDB table."""
+    reasons: list[str] = []
+    vector_dim: int | None = None
+    schema = getattr(table, "schema", None)
+    names = getattr(schema, "names", None)
+    if names is None:
+        return reasons, vector_dim
+
+    col_set = set(names)
+    missing = sorted(REQUIRED_LANCE_COLUMNS - col_set)
+    if missing:
+        reasons.append(f"LanceDB table schema missing columns: {', '.join(missing)}")
+
+    if "vector" in col_set and hasattr(schema, "field"):
+        try:
+            vec_field = schema.field("vector")
+            list_size = getattr(getattr(vec_field, "type", None), "list_size", None)
+            if isinstance(list_size, int) and list_size > 0:
+                vector_dim = list_size
+        except Exception:
+            pass
+
+    return reasons, vector_dim
 
 
 def lance_table_names(db: Any) -> set[str]:
