@@ -38,12 +38,16 @@ from rag_common import (  # noqa: E402
     DEFAULT_EMBED_MODEL as COMMON_DEFAULT_EMBED_MODEL,
     DEFAULT_EMBED_REVISION as COMMON_DEFAULT_EMBED_REVISION,
     DEFAULT_VENDOR_DIRS,
+    INGEST_LOCK_FILENAME,
     MANIFEST_FILENAME,
+    IngestLockBusyError,
     OfflineHashEmbedder,
+    adopt_or_acquire_ingest_lock,
     build_tantivy_schema,
     classify_source_path,
     clean_chunk_text,
     generation_marker_path,
+    ingest_lock_path,
     inspect_lance_table_schema,
     inspect_tantivy_meta_schema,
     journal_file_path,
@@ -573,6 +577,16 @@ def _verify_committed_counts(
             )
 
 
+def _resolve_ingest_lock_path(lancedb_path: str, lock_path: str | None = None) -> str:
+    """Resolve the canonical per-corpus lock path shared with rag_server.py."""
+    if lock_path:
+        return os.path.abspath(lock_path)
+    env_override = os.environ.get("INGEST_LOCKFILE", "").strip()
+    if env_override:
+        return os.path.abspath(env_override)
+    return ingest_lock_path(lancedb_path)
+
+
 def ingest(
     data_dir: str = DEFAULT_DATA_DIR,
     lancedb_path: str = DEFAULT_LANCEDB_PATH,
@@ -589,15 +603,66 @@ def ingest(
     batch_size: int = 32,
     reset: bool = False,
     dry_run: bool = False,
+    lock_path: str | None = None,
 ) -> dict:
     """Ingest documents from data_dir into LanceDB and Tantivy with dual-store parity.
 
-    Reconciles added, modified, emptied, and deleted files across both LanceDB
-    and Tantivy, detects and safely migrates legacy v1 schemas via staged
-    rebuild, validates embedding cardinality/dimensions before mutating either
-    store, coordinates resets via validated staging, writes matching generation
-    markers, and replays interrupted updates from `.ingest_journal.json`.
+    Acquires the shared per-corpus exclusive writer lock (or adopts a verified
+    lock handoff when launched by rag_server.py), reconciles added, modified,
+    emptied, and deleted files across both LanceDB and Tantivy, detects and
+    safely migrates legacy v1 schemas via staged rebuild, validates embedding
+    cardinality/dimensions before mutating either store, coordinates resets via
+    validated staging, writes matching generation markers, and replays
+    interrupted updates from `.ingest_journal.json`.
     """
+    lease = None
+    if not dry_run:
+        lease = adopt_or_acquire_ingest_lock(
+            _resolve_ingest_lock_path(lancedb_path, lock_path),
+            mode="reset" if reset else "incremental",
+            owner="cli",
+        )
+    try:
+        return _ingest_locked(
+            data_dir=data_dir,
+            lancedb_path=lancedb_path,
+            tantivy_path=tantivy_path,
+            lance_table_name=lance_table_name,
+            embed_model=embed_model,
+            embed_revision=embed_revision,
+            embed_url=embed_url,
+            embed_backend=embed_backend,
+            device=device,
+            api_key=api_key,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            batch_size=batch_size,
+            reset=reset,
+            dry_run=dry_run,
+        )
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+def _ingest_locked(
+    *,
+    data_dir: str,
+    lancedb_path: str,
+    tantivy_path: str,
+    lance_table_name: str,
+    embed_model: str,
+    embed_revision: str,
+    embed_url: str,
+    embed_backend: str,
+    device: str,
+    api_key: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    batch_size: int,
+    reset: bool,
+    dry_run: bool,
+) -> dict:
     files = discover_documents(data_dir)
     raw_manifest = read_json_optional(_manifest_path(lancedb_path))
     manifest_state = _load_manifest(lancedb_path)
@@ -997,23 +1062,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    summary = ingest(
-        data_dir=args.data_dir,
-        lancedb_path=args.lancedb_path,
-        tantivy_path=args.tantivy_path,
-        lance_table_name=args.lance_table,
-        embed_model=args.embed_model,
-        embed_revision=args.embed_revision,
-        embed_url=args.embed_url,
-        embed_backend=args.embed_backend,
-        device=args.device,
-        api_key=args.api_key,
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_overlap,
-        batch_size=args.batch_size,
-        reset=args.reset,
-        dry_run=args.dry_run,
-    )
+    try:
+        summary = ingest(
+            data_dir=args.data_dir,
+            lancedb_path=args.lancedb_path,
+            tantivy_path=args.tantivy_path,
+            lance_table_name=args.lance_table,
+            embed_model=args.embed_model,
+            embed_revision=args.embed_revision,
+            embed_url=args.embed_url,
+            embed_backend=args.embed_backend,
+            device=args.device,
+            api_key=args.api_key,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+            batch_size=args.batch_size,
+            reset=args.reset,
+            dry_run=args.dry_run,
+        )
+    except IngestLockBusyError as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "already_running",
+                    "error": str(exc),
+                    "lock_path": exc.lock_path,
+                    "holder_pid": exc.holder_pid,
+                    "holder_mode": exc.holder_mode,
+                    "holder_owner": exc.holder_owner,
+                },
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 2
     print(json.dumps(summary, indent=2))
     return 0
 

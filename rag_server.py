@@ -30,11 +30,15 @@ from rag_common import (
     DEFAULT_EMBED_REVISION,
     DEFAULT_RERANKER_MODEL,
     DEFAULT_RERANKER_REVISION,
+    IngestLockBusyError,
     OfflineHashEmbedder,
     OfflineLexicalReranker,
+    acquire_ingest_lock,
     build_tantivy_schema as _common_build_tantivy_schema,
     clean_chunk_text as _common_clean_chunk_text,
     generation_marker_path,
+    ingest_lock_path,
+    inspect_ingest_lock,
     journal_file_path,
     lance_table_names,
     normalize_rel_path,
@@ -1174,7 +1178,8 @@ except (ValueError, OSError):
 
 INGEST_SCRIPT = os.environ.get("INGEST_SCRIPT", os.path.join(RAG_ROOT, "scripts", "ingest.py"))
 INGEST_PYTHON = os.environ.get("INGEST_PYTHON", sys.executable)
-INGEST_LOCKFILE = os.environ.get("INGEST_LOCKFILE", "/tmp/alfred-rag-ingest.lock")
+# Optional override; when empty, locks per-corpus at <LANCEDB_PATH>/.ingest.lock.
+INGEST_LOCKFILE = os.environ.get("INGEST_LOCKFILE", "").strip()
 INGEST_LOG = os.environ.get("INGEST_LOG", os.path.join(RAG_ROOT, "ingest.log"))
 
 
@@ -1190,31 +1195,22 @@ def _resolve_ingest_script() -> str:
     return os.path.abspath(os.path.join(RAG_ROOT, INGEST_SCRIPT))
 
 
+def _resolve_ingest_lock_path() -> str:
+    """Resolve the shared per-corpus exclusive ingest lock path."""
+    if INGEST_LOCKFILE:
+        return os.path.abspath(INGEST_LOCKFILE)
+    return ingest_lock_path(LANCEDB_PATH)
+
+
 def _ingest_already_running() -> int | None:
-    """Return the pid of a running ingest.py, or None (reaping zombies on Linux)."""
-    if not os.path.exists(INGEST_LOCKFILE):
+    """Return the active owner PID if the per-corpus ingest lock is held, else None."""
+    holder = inspect_ingest_lock(_resolve_ingest_lock_path())
+    if holder is None:
         return None
-    try:
-        with open(INGEST_LOCKFILE) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        if os.path.isdir("/proc"):
-            try:
-                with open(f"/proc/{pid}/status") as sf:
-                    for line in sf:
-                        if line.startswith("State:"):
-                            if line.split()[1].startswith("Z"):
-                                raise ProcessLookupError(f"pid {pid} is zombie")
-                            break
-            except FileNotFoundError:
-                raise ProcessLookupError(f"pid {pid} no /proc entry")
-        return pid
-    except (ValueError, ProcessLookupError, PermissionError, FileNotFoundError):
-        try:
-            os.unlink(INGEST_LOCKFILE)
-        except FileNotFoundError:
-            pass
-        return None
+    pid = holder.get("pid")
+    if pid is None:
+        pid = holder.get("parent_pid")
+    return int(pid) if isinstance(pid, int) else None
 
 
 def _spawn_ingest(*, reset: bool) -> JSONResponse | dict[str, Any]:
@@ -1228,37 +1224,69 @@ def _spawn_ingest(*, reset: bool) -> JSONResponse | dict[str, Any]:
             },
         )
 
-    existing = _ingest_already_running()
-    if existing is not None:
-        return {
-            "status": "already_running",
-            "pid": existing,
-            "log": INGEST_LOG,
-        }
+    mode = "reset" if reset else "incremental"
+    lock_path = _resolve_ingest_lock_path()
+    try:
+        lease = acquire_ingest_lock(
+            lock_path,
+            mode=mode,
+            owner="http",
+            state="spawning",
+            pid=None,
+        )
+    except IngestLockBusyError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "already_running",
+                "pid": exc.holder_pid,
+                "mode": exc.holder_mode,
+                "owner": exc.holder_owner,
+                "lock_path": exc.lock_path,
+                "log": INGEST_LOG,
+                "detail": str(exc),
+            },
+        )
 
     args = [INGEST_PYTHON, script_path]
     if reset:
         args.append("--reset")
 
-    with open(INGEST_LOG, "ab") as log_f:
-        proc = subprocess.Popen(
-            args,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            cwd=RAG_ROOT,
-            start_new_session=True,
-        )
+    child_env = lease.child_env()
+    child_env["LANCEDB_PATH"] = LANCEDB_PATH
+    child_env["TANTIVY_PATH"] = TANTIVY_PATH
+    child_env["LANCE_TABLE"] = LANCE_TABLE
+    if INGEST_LOCKFILE:
+        child_env["INGEST_LOCKFILE"] = lease.lock_path
+    else:
+        child_env.pop("INGEST_LOCKFILE", None)
+
     try:
-        with open(INGEST_LOCKFILE, "w") as f:
-            f.write(str(proc.pid))
-    except OSError:
-        pass
+        log_parent = os.path.dirname(os.path.abspath(INGEST_LOG))
+        if log_parent:
+            os.makedirs(log_parent, exist_ok=True)
+        with open(INGEST_LOG, "ab") as log_f:
+            proc = subprocess.Popen(
+                args,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                cwd=RAG_ROOT,
+                env=child_env,
+                pass_fds=(lease.fd,),
+                start_new_session=True,
+            )
+    except BaseException:
+        lease.release()
+        raise
+
+    lease.handoff_to_child(proc.pid)
 
     return {
         "status": "started",
         "pid": proc.pid,
-        "mode": "reset" if reset else "incremental",
+        "mode": mode,
         "script": script_path,
+        "lock_path": lease.lock_path,
         "log": INGEST_LOG,
     }
 

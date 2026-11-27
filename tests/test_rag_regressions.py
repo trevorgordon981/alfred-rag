@@ -1,14 +1,19 @@
-"""Comprehensive regression tests covering RAG-01 through RAG-07 against real
+"""Comprehensive regression tests covering RAG-01 through RAG-08 against real
 CPU LanceDB and Tantivy indexes.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime as dt
+import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -46,6 +51,8 @@ class _ServerStateGuard:
         "LANCE_TABLE",
         "RAG_API_KEY",
         "RAG_ADMIN_API_KEY",
+        "INGEST_SCRIPT",
+        "INGEST_PYTHON",
         "INGEST_LOCKFILE",
         "INGEST_LOG",
         "LABEL_EMBED",
@@ -1174,6 +1181,345 @@ class TestRAG07PrometheusMetricsContract(unittest.TestCase):
                 "llm_tool_calls_total",
             ):
                 self.assertIn(metric_name, scrape)
+
+
+class TestRAG08ExclusiveIngestAdmission(unittest.TestCase):
+    """RAG-08: atomic per-corpus exclusive ingest admission across HTTP and CLI writers."""
+
+    def test_concurrent_http_ingest_and_reset_admit_exactly_one_at_popen_pause(self) -> None:
+        with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
+            lancedb_dir = str(Path(tmpdir) / "lancedb")
+            rag_server.LANCEDB_PATH = lancedb_dir
+            rag_server.TANTIVY_PATH = str(Path(tmpdir) / "tantivy")
+            rag_server.INGEST_LOCKFILE = ""
+            rag_server.INGEST_LOG = os.path.join(tmpdir, "ingest.log")
+            client = TestClient(rag_server.app)
+
+            entered_popen = threading.Event()
+            release_popen = threading.Event()
+            popen_calls: list[tuple[list[str], dict]] = []
+            calls_lock = threading.Lock()
+
+            def controlled_popen(args, **kwargs):
+                with calls_lock:
+                    popen_calls.append((list(args), dict(kwargs)))
+                    pid = 100000 + len(popen_calls)
+                entered_popen.set()
+                release_popen.wait(timeout=5)
+                return types.SimpleNamespace(pid=pid)
+
+            with mock.patch.object(rag_server.subprocess, "Popen", side_effect=controlled_popen):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    first_fut = pool.submit(
+                        client.post, "/ingest", json={"incremental": True, "reset": False}
+                    )
+                    self.assertTrue(
+                        entered_popen.wait(timeout=3),
+                        "First /ingest request did not enter Popen in time",
+                    )
+
+                    # While request 1 is paused inside Popen, a concurrent reset MUST
+                    # immediately fail closed with HTTP 409 without touching Popen.
+                    second_resp = client.post("/admin/ingest/reset")
+                    self.assertEqual(second_resp.status_code, 409)
+                    second_body = second_resp.json()
+                    self.assertEqual(second_body["status"], "already_running")
+                    self.assertEqual(second_body["mode"], "incremental")
+                    self.assertEqual(len(popen_calls), 1)
+
+                    # A direct CLI ingest() against the same corpus MUST also fail closed.
+                    data_dir = Path(tmpdir) / "data"
+                    data_dir.mkdir(parents=True, exist_ok=True)
+                    (data_dir / "doc.md").write_text("Blocked CLI doc.", encoding="utf-8")
+                    with self.assertRaises(rag_common.IngestLockBusyError):
+                        ingest_mod.ingest(
+                            data_dir=str(data_dir),
+                            lancedb_path=lancedb_dir,
+                            tantivy_path=rag_server.TANTIVY_PATH,
+                            embed_backend="offline",
+                            reset=False,
+                        )
+
+                    release_popen.set()
+                    first_resp = first_fut.result(timeout=5)
+
+            self.assertEqual(first_resp.status_code, 200)
+            first_body = first_resp.json()
+            self.assertEqual(first_body["status"], "started")
+            self.assertEqual(first_body["mode"], "incremental")
+            self.assertEqual(first_body["pid"], 100001)
+            self.assertEqual(len(popen_calls), 1)
+
+            # Verify verified handoff fd + token were passed to Popen and lease records the single PID.
+            spawn_kwargs = popen_calls[0][1]
+            self.assertIn("pass_fds", spawn_kwargs)
+            self.assertEqual(len(spawn_kwargs["pass_fds"]), 1)
+            spawn_env = spawn_kwargs["env"]
+            self.assertEqual(
+                spawn_env[rag_common.INGEST_LOCK_ENV_FD],
+                str(spawn_kwargs["pass_fds"][0]),
+            )
+            self.assertTrue(spawn_env[rag_common.INGEST_LOCK_ENV_TOKEN])
+
+            lease_file = rag_common.ingest_lease_path(rag_common.ingest_lock_path(lancedb_dir))
+            lease_data = rag_common.read_json_optional(lease_file)
+            self.assertIsNotNone(lease_data)
+            self.assertEqual(lease_data["pid"], 100001)
+            self.assertEqual(lease_data["mode"], "incremental")
+
+    def test_exact_rag08_barrier_counterexample_never_runs_second_popen_and_releases_on_error(
+        self,
+    ) -> None:
+        with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
+            rag_server.LANCEDB_PATH = str(Path(tmpdir) / "lancedb")
+            rag_server.TANTIVY_PATH = str(Path(tmpdir) / "tantivy")
+            rag_server.INGEST_LOCKFILE = ""
+            rag_server.INGEST_LOG = os.path.join(tmpdir, "ingest.log")
+            client = TestClient(rag_server.app, raise_server_exceptions=False)
+
+            barrier = threading.Barrier(2, timeout=0.4)
+            initiated: list[int] = []
+            mutex = threading.Lock()
+
+            def barrier_popen(args, **kwargs):
+                with mutex:
+                    initiated.append(len(initiated) + 1)
+                    pid = 100000 + initiated[-1]
+                # Under the old buggy code, BOTH threads reached this barrier and both started.
+                # Under the fixed exclusive lock, ONLY ONE thread enters Popen while the second
+                # gets HTTP 409 immediately, so this barrier MUST time out with BrokenBarrierError.
+                barrier.wait()
+                return types.SimpleNamespace(pid=pid)
+
+            with mock.patch.object(rag_server.subprocess, "Popen", side_effect=barrier_popen):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    futs = [
+                        pool.submit(
+                            client.post, "/ingest", json={"incremental": True, "reset": False}
+                        ),
+                        pool.submit(client.post, "/admin/ingest/reset"),
+                    ]
+                    responses = [f.result(timeout=5) for f in futs]
+
+            self.assertEqual(
+                len(initiated),
+                1,
+                f"Expected exactly one Popen attempt, saw {initiated}",
+            )
+            statuses = sorted(r.status_code for r in responses)
+            self.assertEqual(statuses, [409, 500])
+            conflict = next(r for r in responses if r.status_code == 409)
+            self.assertEqual(conflict.json()["status"], "already_running")
+
+            # After the failed Popen, the lock must be cleanly released so a subsequent call starts.
+            with mock.patch.object(
+                rag_server.subprocess,
+                "Popen",
+                return_value=types.SimpleNamespace(pid=200001),
+            ):
+                followup = client.post("/ingest", json={"incremental": True, "reset": False})
+            self.assertEqual(followup.status_code, 200)
+            self.assertEqual(followup.json()["pid"], 200001)
+
+    def test_cross_process_lock_blocks_http_and_cli_and_cleans_up_on_release(self) -> None:
+        with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            (data_dir / "notes").mkdir(parents=True)
+            (data_dir / "notes" / "sample.md").write_text(
+                "Cross-process lock verification passage.", encoding="utf-8"
+            )
+            lancedb_dir = str(Path(tmpdir) / "lancedb")
+            tantivy_dir = str(Path(tmpdir) / "tantivy")
+            rag_server.LANCEDB_PATH = lancedb_dir
+            rag_server.TANTIVY_PATH = tantivy_dir
+            rag_server.INGEST_LOCKFILE = ""
+            rag_server.INGEST_LOG = os.path.join(tmpdir, "ingest.log")
+            client = TestClient(rag_server.app)
+
+            ready_flag = Path(tmpdir) / "holder.ready"
+            stop_flag = Path(tmpdir) / "holder.stop"
+            holder_code = (
+                "import os, sys, time\n"
+                f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+                "import rag_common\n"
+                f"lp = rag_common.ingest_lock_path({lancedb_dir!r})\n"
+                "with rag_common.acquire_ingest_lock(lp, mode='reset', owner='cli', pid=os.getpid()):\n"
+                f"    open({str(ready_flag)!r}, 'w').write(str(os.getpid()))\n"
+                f"    while not os.path.exists({str(stop_flag)!r}):\n"
+                "        time.sleep(0.02)\n"
+            )
+            holder_proc = subprocess.Popen(
+                [sys.executable, "-c", holder_code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 5.0
+                while not ready_flag.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(ready_flag.exists(), "Holder subprocess failed to acquire lock")
+                holder_pid = int(ready_flag.read_text(encoding="utf-8").strip())
+
+                # HTTP /ingest and /admin/ingest/reset must fail closed with 409 and 0 Popen calls.
+                with mock.patch.object(rag_server.subprocess, "Popen") as mock_popen:
+                    r1 = client.post("/ingest", json={"incremental": True, "reset": False})
+                    r2 = client.post("/admin/ingest/reset")
+                mock_popen.assert_not_called()
+                self.assertEqual(r1.status_code, 409)
+                self.assertEqual(r2.status_code, 409)
+                self.assertEqual(r1.json()["status"], "already_running")
+                self.assertEqual(r1.json()["pid"], holder_pid)
+                self.assertEqual(r2.json()["pid"], holder_pid)
+
+                # Direct Python ingest() must fail closed with IngestLockBusyError.
+                with self.assertRaises(rag_common.IngestLockBusyError) as ctx:
+                    ingest_mod.ingest(
+                        data_dir=str(data_dir),
+                        lancedb_path=lancedb_dir,
+                        tantivy_path=tantivy_dir,
+                        embed_backend="offline",
+                        reset=False,
+                    )
+                self.assertEqual(ctx.exception.holder_pid, holder_pid)
+
+                # Direct CLI main() must exit non-zero (2) without mutating indexes.
+                stderr_buf = io.StringIO()
+                with mock.patch.object(sys, "stderr", stderr_buf):
+                    rc = ingest_mod.main(
+                        [
+                            "--data-dir",
+                            str(data_dir),
+                            "--lancedb-path",
+                            lancedb_dir,
+                            "--tantivy-path",
+                            tantivy_dir,
+                            "--embed-backend",
+                            "offline",
+                        ]
+                    )
+                self.assertEqual(rc, 2)
+                self.assertIn("already_running", stderr_buf.getvalue())
+
+                # Spoofed handoff env vars MUST NOT bypass the active cross-process lock.
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        rag_common.INGEST_LOCK_ENV_PATH: rag_common.ingest_lock_path(lancedb_dir),
+                        rag_common.INGEST_LOCK_ENV_FD: "0",
+                        rag_common.INGEST_LOCK_ENV_TOKEN: "forged-token",
+                    },
+                    clear=False,
+                ):
+                    with self.assertRaises(rag_common.IngestLockBusyError):
+                        ingest_mod.ingest(
+                            data_dir=str(data_dir),
+                            lancedb_path=lancedb_dir,
+                            tantivy_path=tantivy_dir,
+                            embed_backend="offline",
+                            reset=False,
+                        )
+
+                # A separate corpus has its own per-corpus lock and is NOT blocked.
+                other_lance = str(Path(tmpdir) / "other_lancedb")
+                other_tantivy = str(Path(tmpdir) / "other_tantivy")
+                other_summary = ingest_mod.ingest(
+                    data_dir=str(data_dir),
+                    lancedb_path=other_lance,
+                    tantivy_path=other_tantivy,
+                    lance_table_name="other_rag",
+                    embed_backend="offline",
+                    reset=True,
+                )
+                self.assertEqual(other_summary["total_chunks"], 1)
+            finally:
+                stop_flag.write_text("stop", encoding="utf-8")
+                holder_proc.communicate(timeout=5)
+
+            # Once the cross-process holder exits, CLI ingest acquires the lock and succeeds cleanly.
+            summary = ingest_mod.ingest(
+                data_dir=str(data_dir),
+                lancedb_path=lancedb_dir,
+                tantivy_path=tantivy_dir,
+                lance_table_name="lock_test",
+                embed_backend="offline",
+                reset=True,
+            )
+            self.assertEqual(summary["total_chunks"], 1)
+            self.assertIsNone(rag_common.inspect_ingest_lock(rag_common.ingest_lock_path(lancedb_dir)))
+
+    def test_real_http_spawn_handoff_keeps_lock_held_until_child_exits(self) -> None:
+        with _ServerStateGuard(), tempfile.TemporaryDirectory() as tmpdir:
+            lancedb_dir = str(Path(tmpdir) / "lancedb")
+            tantivy_dir = str(Path(tmpdir) / "tantivy")
+            worker_script = Path(tmpdir) / "fake_ingest_worker.py"
+            adopted_flag = Path(tmpdir) / "worker.adopted"
+            release_flag = Path(tmpdir) / "worker.release"
+
+            worker_script.write_text(
+                "import os, sys, time\n"
+                f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+                "import rag_common\n"
+                "lp = rag_common.ingest_lock_path(os.environ['LANCEDB_PATH'])\n"
+                "with rag_common.adopt_or_acquire_ingest_lock(lp, mode='incremental', owner='cli') as lease:\n"
+                "    assert lease.metadata['owner'] == 'http-worker', lease.metadata\n"
+                f"    open({str(adopted_flag)!r}, 'w').write(str(os.getpid()))\n"
+                f"    while not os.path.exists({str(release_flag)!r}):\n"
+                "        time.sleep(0.02)\n",
+                encoding="utf-8",
+            )
+
+            rag_server.LANCEDB_PATH = lancedb_dir
+            rag_server.TANTIVY_PATH = tantivy_dir
+            rag_server.INGEST_LOCKFILE = ""
+            rag_server.INGEST_SCRIPT = str(worker_script)
+            rag_server.INGEST_PYTHON = sys.executable
+            rag_server.INGEST_LOG = os.path.join(tmpdir, "ingest.log")
+            client = TestClient(rag_server.app)
+
+            try:
+                resp = client.post("/ingest", json={"incremental": True, "reset": False})
+                self.assertEqual(resp.status_code, 200)
+                child_pid = resp.json()["pid"]
+
+                deadline = time.monotonic() + 5.0
+                while not adopted_flag.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(
+                    adopted_flag.exists(),
+                    f"Child worker did not adopt lock; log={Path(rag_server.INGEST_LOG).read_text(encoding='utf-8', errors='replace')}",
+                )
+                self.assertEqual(int(adopted_flag.read_text(encoding="utf-8").strip()), child_pid)
+
+                # While the real child holds the handed-off lock, another HTTP request gets 409!
+                conflict = client.post("/admin/ingest/reset")
+                self.assertEqual(conflict.status_code, 409)
+                self.assertEqual(conflict.json()["status"], "already_running")
+                self.assertEqual(conflict.json()["pid"], child_pid)
+                self.assertEqual(conflict.json()["owner"], "http-worker")
+
+                # And a direct CLI ingest() against the same corpus fails closed!
+                data_dir = Path(tmpdir) / "data"
+                data_dir.mkdir(parents=True, exist_ok=True)
+                (data_dir / "a.md").write_text("Blocked while child runs.", encoding="utf-8")
+                with self.assertRaises(rag_common.IngestLockBusyError) as ctx:
+                    ingest_mod.ingest(
+                        data_dir=str(data_dir),
+                        lancedb_path=lancedb_dir,
+                        tantivy_path=tantivy_dir,
+                        embed_backend="offline",
+                        reset=False,
+                    )
+                self.assertEqual(ctx.exception.holder_pid, child_pid)
+            finally:
+                release_flag.write_text("done", encoding="utf-8")
+
+            # Wait for child to exit and release its flock.
+            lock_path = rag_common.ingest_lock_path(lancedb_dir)
+            deadline = time.monotonic() + 5.0
+            while rag_common.inspect_ingest_lock(lock_path) is not None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertIsNone(rag_common.inspect_ingest_lock(lock_path))
 
 
 class TestOfflineDemoFixture(unittest.TestCase):

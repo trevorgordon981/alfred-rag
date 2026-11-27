@@ -4,19 +4,34 @@ for alfred-rag (used by both rag_server.py and scripts/ingest.py).
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 
 # --- Shared filenames for dual-store coordination ---
 MANIFEST_FILENAME = ".ingest_manifest.json"
 JOURNAL_FILENAME = ".ingest_journal.json"
 GENERATION_FILENAME = ".generation.json"
+INGEST_LOCK_FILENAME = ".ingest.lock"
+
+# Environment variables for verified parent->child exclusive ingest lock handoff.
+INGEST_LOCK_ENV_PATH = "ALFRED_INGEST_LOCK_PATH"
+INGEST_LOCK_ENV_FD = "ALFRED_INGEST_LOCK_FD"
+INGEST_LOCK_ENV_TOKEN = "ALFRED_INGEST_LOCK_TOKEN"
 
 # --- Shared default model revisions ---
 DEFAULT_EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
@@ -277,7 +292,7 @@ def utc_now_iso() -> str:
 def write_json_atomic(path: str, payload: dict[str, Any]) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}"
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
     os.replace(tmp, path)
@@ -300,6 +315,352 @@ def generation_marker_path(store_dir: str) -> str:
 
 def journal_file_path(lancedb_path: str) -> str:
     return os.path.join(lancedb_path, JOURNAL_FILENAME)
+
+
+# --- Per-corpus exclusive ingest writer lock (shared by HTTP server and CLI) ---
+
+_INGEST_LOCK_MUTEX = threading.Lock()
+_ACTIVE_INGEST_LEASES: dict[str, dict[str, Any]] = {}
+
+
+def canonical_lock_path(path: str) -> str:
+    """Resolve symlinks and relative segments so threads/processes share one key."""
+    return os.path.realpath(os.path.abspath(path))
+
+
+def ingest_lock_path(lancedb_path: str) -> str:
+    """Canonical per-corpus lock file path inside the LanceDB directory."""
+    return canonical_lock_path(os.path.join(lancedb_path, INGEST_LOCK_FILENAME))
+
+
+def ingest_lease_path(lock_path: str) -> str:
+    """Atomic JSON lease metadata companion path for a canonical lock file."""
+    return f"{canonical_lock_path(lock_path)}.lease.json"
+
+
+class IngestLockBusyError(RuntimeError):
+    """Raised when another HTTP or CLI ingest already owns the per-corpus lock."""
+
+    def __init__(
+        self,
+        lock_path: str,
+        holder: dict[str, Any] | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.lock_path = canonical_lock_path(lock_path)
+        self.holder: dict[str, Any] = dict(holder) if isinstance(holder, dict) else {}
+        raw_pid = self.holder.get("pid")
+        if raw_pid is None:
+            raw_pid = self.holder.get("parent_pid")
+        self.holder_pid: int | None = int(raw_pid) if isinstance(raw_pid, int) else None
+        self.holder_mode: str | None = (
+            str(self.holder["mode"]) if self.holder.get("mode") is not None else None
+        )
+        self.holder_owner: str | None = (
+            str(self.holder["owner"]) if self.holder.get("owner") is not None else None
+        )
+        self.holder_state: str | None = (
+            str(self.holder["state"]) if self.holder.get("state") is not None else None
+        )
+        if message is None:
+            parts: list[str] = []
+            if self.holder_pid is not None:
+                parts.append(f"pid={self.holder_pid}")
+            if self.holder_mode:
+                parts.append(f"mode={self.holder_mode}")
+            if self.holder_owner:
+                parts.append(f"owner={self.holder_owner}")
+            if self.holder_state:
+                parts.append(f"state={self.holder_state}")
+            detail = f" ({', '.join(parts)})" if parts else ""
+            message = f"Ingest lock already held for corpus at {self.lock_path}{detail}"
+        super().__init__(message)
+
+
+class IngestLockLease:
+    """Exclusive per-corpus writer lease backed by flock + in-process registry + atomic lease file."""
+
+    def __init__(
+        self,
+        *,
+        lock_path: str,
+        lease_path: str,
+        fd: int,
+        token: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        self.lock_path = lock_path
+        self.lease_path = lease_path
+        self.fd = fd
+        self.token = token
+        self.metadata = dict(metadata)
+        self._closed = False
+
+    def child_env(self, base_env: dict[str, str] | None = None) -> dict[str, str]:
+        """Build child environment carrying verified lock-handoff credentials."""
+        env = dict(os.environ if base_env is None else base_env)
+        env[INGEST_LOCK_ENV_PATH] = self.lock_path
+        env[INGEST_LOCK_ENV_FD] = str(self.fd)
+        env[INGEST_LOCK_ENV_TOKEN] = self.token
+        return env
+
+    def handoff_to_child(self, child_pid: int) -> None:
+        """Hand kernel flock ownership to a spawned child that inherited self.fd.
+
+        Updates the atomic lease file with the child PID if still in 'spawning'
+        state, then closes the parent's fd WITHOUT calling LOCK_UN so the child's
+        open file description keeps the exclusive flock until the child exits.
+        """
+        with _INGEST_LOCK_MUTEX:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                current = read_json_optional(self.lease_path)
+                if (
+                    current is not None
+                    and isinstance(current.get("token"), str)
+                    and hmac.compare_digest(current["token"], self.token)
+                    and current.get("state") == "spawning"
+                ):
+                    updated = dict(current)
+                    updated["pid"] = int(child_pid)
+                    updated["state"] = "running"
+                    write_json_atomic(self.lease_path, updated)
+                    self.metadata = updated
+            except OSError:
+                pass
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            active = _ACTIVE_INGEST_LEASES.get(self.lock_path)
+            if active is not None and active.get("token") == self.token:
+                _ACTIVE_INGEST_LEASES.pop(self.lock_path, None)
+
+    def release(self) -> None:
+        """Release the exclusive lock completely (on writer completion or spawn failure)."""
+        with _INGEST_LOCK_MUTEX:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                current = read_json_optional(self.lease_path)
+                if (
+                    current is not None
+                    and isinstance(current.get("token"), str)
+                    and hmac.compare_digest(current["token"], self.token)
+                ):
+                    try:
+                        os.unlink(self.lease_path)
+                    except FileNotFoundError:
+                        pass
+            except OSError:
+                pass
+            try:
+                if fcntl is not None:
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            active = _ACTIVE_INGEST_LEASES.get(self.lock_path)
+            if active is not None and active.get("token") == self.token:
+                _ACTIVE_INGEST_LEASES.pop(self.lock_path, None)
+
+    def __enter__(self) -> IngestLockLease:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.release()
+
+
+def acquire_ingest_lock(
+    lock_path: str,
+    *,
+    mode: str,
+    owner: str,
+    state: str = "running",
+    pid: int | None = None,
+) -> IngestLockLease:
+    """Atomically acquire the non-blocking exclusive per-corpus ingest lock.
+
+    Never unlinks the flock anchor file so concurrent openers always synchronize
+    on the exact same inode. Raises IngestLockBusyError immediately if any
+    thread or process already holds the lock.
+    """
+    canon = canonical_lock_path(lock_path)
+    lpath = ingest_lease_path(canon)
+    parent = os.path.dirname(canon)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with _INGEST_LOCK_MUTEX:
+        active = _ACTIVE_INGEST_LEASES.get(canon)
+        if active is not None:
+            raise IngestLockBusyError(canon, active)
+
+        fd = os.open(canon, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                        holder = read_json_optional(lpath)
+                        raise IngestLockBusyError(canon, holder) from exc
+                    raise
+
+            token = secrets.token_hex(16)
+            metadata: dict[str, Any] = {
+                "schema_version": 1,
+                "lock_path": canon,
+                "token": token,
+                "pid": pid,
+                "parent_pid": os.getpid(),
+                "mode": mode,
+                "owner": owner,
+                "state": state,
+                "acquired_at": utc_now_iso(),
+            }
+            write_json_atomic(lpath, metadata)
+            _ACTIVE_INGEST_LEASES[canon] = dict(metadata)
+            return IngestLockLease(
+                lock_path=canon,
+                lease_path=lpath,
+                fd=fd,
+                token=token,
+                metadata=metadata,
+            )
+        except BaseException:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
+
+def adopt_or_acquire_ingest_lock(
+    lock_path: str,
+    *,
+    mode: str,
+    owner: str = "cli",
+) -> IngestLockLease:
+    """Adopt a verified inherited HTTP-spawned lock fd if present, else acquire a fresh lock."""
+    canon = canonical_lock_path(lock_path)
+    lpath = ingest_lease_path(canon)
+
+    env_path = os.environ.get(INGEST_LOCK_ENV_PATH, "").strip()
+    env_fd_raw = os.environ.get(INGEST_LOCK_ENV_FD, "").strip()
+    env_token = os.environ.get(INGEST_LOCK_ENV_TOKEN, "").strip()
+
+    if env_path and env_fd_raw and env_token and canonical_lock_path(env_path) == canon:
+        os.environ.pop(INGEST_LOCK_ENV_PATH, None)
+        os.environ.pop(INGEST_LOCK_ENV_FD, None)
+        os.environ.pop(INGEST_LOCK_ENV_TOKEN, None)
+        try:
+            inherited_fd = int(env_fd_raw)
+            if inherited_fd >= 0:
+                st_fd = os.fstat(inherited_fd)
+                st_file = os.stat(canon)
+                same_inode = (
+                    st_fd.st_dev == st_file.st_dev and st_fd.st_ino == st_file.st_ino
+                )
+                lease_data = read_json_optional(lpath)
+                token_ok = (
+                    lease_data is not None
+                    and isinstance(lease_data.get("token"), str)
+                    and hmac.compare_digest(lease_data["token"], env_token)
+                )
+                if same_inode and token_ok:
+                    with _INGEST_LOCK_MUTEX:
+                        active = _ACTIVE_INGEST_LEASES.get(canon)
+                        if active is not None:
+                            raise IngestLockBusyError(canon, active)
+                        if fcntl is not None:
+                            try:
+                                fcntl.flock(inherited_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except OSError as exc:
+                                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                                    raise IngestLockBusyError(canon, lease_data) from exc
+                                raise
+                        updated: dict[str, Any] = {
+                            "schema_version": 1,
+                            "lock_path": canon,
+                            "token": env_token,
+                            "pid": os.getpid(),
+                            "parent_pid": lease_data.get("parent_pid"),
+                            "mode": mode,
+                            "owner": "http-worker",
+                            "state": "running",
+                            "acquired_at": lease_data.get("acquired_at") or utc_now_iso(),
+                        }
+                        write_json_atomic(lpath, updated)
+                        _ACTIVE_INGEST_LEASES[canon] = dict(updated)
+                        return IngestLockLease(
+                            lock_path=canon,
+                            lease_path=lpath,
+                            fd=inherited_fd,
+                            token=env_token,
+                            metadata=updated,
+                        )
+        except IngestLockBusyError:
+            raise
+        except (ValueError, OSError):
+            pass
+
+    return acquire_ingest_lock(
+        canon,
+        mode=mode,
+        owner=owner,
+        state="running",
+        pid=os.getpid(),
+    )
+
+
+def inspect_ingest_lock(lock_path: str) -> dict[str, Any] | None:
+    """Return active lease metadata if the per-corpus lock is currently held, else None."""
+    canon = canonical_lock_path(lock_path)
+    lpath = ingest_lease_path(canon)
+    with _INGEST_LOCK_MUTEX:
+        active = _ACTIVE_INGEST_LEASES.get(canon)
+        if active is not None:
+            return dict(active)
+
+        if not os.path.exists(canon) or fcntl is None:
+            return None
+
+        try:
+            fd = os.open(canon, os.O_RDWR)
+        except OSError:
+            return None
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                    holder = read_json_optional(lpath) or {}
+                    holder.setdefault("lock_path", canon)
+                    return holder
+                return None
+            else:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                return None
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 # --- Deterministic CPU-only offline models (no GPU / no HF weights required) ---
