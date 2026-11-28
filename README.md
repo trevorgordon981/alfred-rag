@@ -2,6 +2,8 @@
 
 A hybrid retrieval and reranking service combining dense vector search ([LanceDB](https://lancedb.com/)), sparse BM25 full-text search ([Tantivy](https://github.com/quickwit-oss/tantivy)), Reciprocal Rank Fusion (RRF), and cross-encoder reranking (`Qwen3-Reranker-8B`), plus a deterministic CPU-only offline mode and a `sentence-transformers` fine-tuning recipe.
 
+![alfred-rag offline hybrid retrieval demo](docs/demo-terminal.png)
+
 ## Problem
 
 Running hybrid retrieval in production over a living document corpus fails in predictable ways that neither a vector store nor a full-text engine solves on its own:
@@ -71,9 +73,12 @@ LanceDB and Tantivy provide the underlying vector and BM25 primitives; `alfred-r
 
 ## 5-Minute Offline Demo (CPU-Only, No GPU / No Private Data)
 
-### 1. Install lightweight CPU dependencies
+**Requires Python >= 3.11.**
+
+### 1. Create a virtual environment and install lightweight CPU dependencies
 
 ```bash
+python3.11 -m venv .venv && source .venv/bin/activate
 python -m pip install -r requirements-offline.txt
 # Equivalent explicit package list:
 # python -m pip install fastapi uvicorn pydantic lancedb tantivy prometheus-client requests httpx
@@ -149,6 +154,22 @@ This runs unit tests plus real CPU LanceDB + Tantivy integration tests covering:
 - Explicit `source_class=vendor` deprioritization and real fast-path RRF tie-breaking by recency
 - Loopback bind safety, API-key & admin-reset authorization, and request body/parameter bounds
 - Prometheus metric naming and scored-document accounting
+
+## Measured Results
+
+Verified in a clean, isolated Python 3.11 virtual environment (`requirements-offline.txt`, CPU-only `RAG_BACKEND=offline`) against the public synthetic fixture corpus (`fixtures/demo_corpus/`, 9 files / 10 chunks) and labeled query set (`fixtures/demo_eval_queries.json`, 10 queries):
+
+| Check | Measured Result |
+|---|---|
+| `python scripts/offline_demo.py` wall time | `5.272s` (exit code `0`) |
+| Labeled query pass rate | `10/10` (`100%`, `pass_rate: 1.0`) |
+| Exact document recall & ranking (9 in-domain queries) | `Hit@1: 9/9`, `Hit@k: 9/9`, `MRR: 1.0` |
+| Verbatim quoted span check | `9/9` matched (`span_all_matched: 9/9`) |
+| Out-of-domain negative control | `1/1` rejected (`ood_rejected: 1/1`) |
+| `/search` vs `/search/debug` rank & score parity | `10/10` (`parity_checks_passed: 10`) |
+| Deletion & emptying reconciliation | `1` file deleted + `1` file emptied → `2` chunks purged; `8` LanceDB / `8` Tantivy remaining (`generation=2`) |
+| Prometheus `/metrics` contract | `ok` |
+| `python -m unittest discover -s tests -v` | `38/38` tests passed (`OK` in `17.172s`, wall time `18.043s`) |
 
 ## Serving with GPU Models (`Qwen3-Embedding-8B` + `Qwen3-Reranker-8B`)
 
